@@ -10,7 +10,8 @@
 
 // ================================================================
 //  THROWIO MOD - AXIOM DEVELOPMENT
-//  FINAL v4 — BNM::Method<> removed, getOffset+AddPointer only
+//  FINAL v5 — Validate offset userspace range trước DHK
+//  Root cause: getOffset() trả garbage 0xec... khi domain chưa ready
 // ================================================================
 
 // ================================================================
@@ -35,13 +36,13 @@ void (*orig_set_SoftMoney)   (void*, long)  = nullptr;
 //  TOGGLES
 // ================================================================
 namespace SWITCH {
-    bool InfiniteMoney   = false;
-    bool InfinitePremium = false;
-    bool MaxLevel        = false;
-    bool NoAds           = false;
-    bool GodMode         = false;
-    bool SpeedHack       = false;
-    bool AntiCheat       = true;
+    bool InfiniteMoney    = false;
+    bool InfinitePremium  = false;
+    bool MaxLevel         = false;
+    bool NoAds            = false;
+    bool GodMode          = false;
+    bool SpeedHack        = false;
+    bool AntiCheat        = true;
     bool ForceUpdateMoney = false;
     bool ForceMaxLevel    = false;
 }
@@ -65,7 +66,7 @@ static EGLContext g_savedContext = EGL_NO_CONTEXT;
 EGLBoolean (*old_eglSwapBuffers)(EGLDisplay, EGLSurface) = nullptr;
 
 // ================================================================
-//  IL2CPP DOMAIN VALIDATION TYPEDEFS
+//  IL2CPP DOMAIN TYPEDEFS
 // ================================================================
 typedef void*        (*fn_domain_get)();
 typedef void**       (*fn_domain_get_assemblies)(void* domain, size_t* count);
@@ -79,7 +80,7 @@ static bool IsValidPtr(const void* ptr, size_t sz = sizeof(void*)) {
     if (!ptr) return false;
     uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
     if (addr < 0x10000ULL)        return false;
-    if (addr > 0x7fffffffffffULL) return false;
+    if (addr > 0x7fffffffffffULL) return false; // phải userspace
     if (addr & 0x1)               return false;
 
     long ps = sysconf(_SC_PAGESIZE);
@@ -95,7 +96,23 @@ static bool IsValidPtr(const void* ptr, size_t sz = sizeof(void*)) {
 }
 
 // ================================================================
-//  WAIT FOR IL2CPP ASSEMBLIES — probe domain trực tiếp
+//  FIX UTAMA: Validate offset là userspace address hợp lệ
+//  getOffset() đôi khi trả 0xec1e3d49xx — garbage, không phải 0x7...
+//  Nếu pass cái này vào DHK() thì Dobby trampoline crash ngay
+// ================================================================
+static bool IsValidOffset(uintptr_t off) {
+    if (!off) return false;
+
+    // Phải là userspace address (0x7xxx...) — ARM64 userspace < 0x800000000000
+    if (off < 0x100000ULL)        return false; // quá nhỏ — relative offset, không phải absolute
+    if (off > 0x7fffffffffffULL)  return false; // không phải userspace — 0xec... = INVALID
+
+    // Probe memory — địa chỉ phải actually mapped
+    return IsValidPtr(reinterpret_cast<void*>(off), 4);
+}
+
+// ================================================================
+//  WAIT FOR IL2CPP ASSEMBLIES
 // ================================================================
 static bool ValidateAssemblyEntry(
     fn_assembly_get_image agf,
@@ -110,32 +127,34 @@ static bool ValidateAssemblyEntry(
     return name[0] != '\0';
 }
 
-static bool WaitForAssembliesReady(int maxWaitMs = 20000) {
+static bool WaitForAssembliesReady(int maxWaitMs = 30000) {
     void* lib = dlopen("libil2cpp.so", RTLD_NOLOAD);
-    if (!lib) { usleep(8000000); return true; }
+    if (!lib) { usleep(10000000); return true; }
 
-    auto domain_get  = (fn_domain_get)          dlsym(lib, "il2cpp_domain_get");
-    auto dom_get_asm = (fn_domain_get_assemblies)dlsym(lib, "il2cpp_domain_get_assemblies");
-    auto asm_get_img = (fn_assembly_get_image)   dlsym(lib, "il2cpp_assembly_get_image");
-    auto img_get_nm  = (fn_image_get_name)       dlsym(lib, "il2cpp_image_get_name");
+    auto domain_get  = (fn_domain_get)           dlsym(lib, "il2cpp_domain_get");
+    auto dom_get_asm = (fn_domain_get_assemblies) dlsym(lib, "il2cpp_domain_get_assemblies");
+    auto asm_get_img = (fn_assembly_get_image)    dlsym(lib, "il2cpp_assembly_get_image");
+    auto img_get_nm  = (fn_image_get_name)        dlsym(lib, "il2cpp_image_get_name");
 
     if (!domain_get || !dom_get_asm || !asm_get_img || !img_get_nm) {
         dlclose(lib);
-        usleep(8000000);
+        usleep(10000000);
         return true;
     }
 
-    const int step  = 200;
+    const int step  = 300; // ms
     int elapsed     = 0;
-    int stableCount = 0;
+    int stableCount = 0;   // butuh 5x stable berturut-turut
 
     while (elapsed < maxWaitMs) {
         void* domain = domain_get();
         if (!IsValidPtr(domain)) { stableCount = 0; goto retry; }
 
         {
-            size_t count    = 0;
+            size_t count      = 0;
             void** assemblies = dom_get_asm(domain, &count);
+
+            // count harus reasonable
             if (!IsValidPtr(assemblies) || count < 10 || count > 4096) {
                 stableCount = 0; goto retry;
             }
@@ -148,7 +167,11 @@ static bool WaitForAssembliesReady(int maxWaitMs = 20000) {
             }
 
             if (allValid) {
-                if (++stableCount >= 3) { dlclose(lib); return true; }
+                if (++stableCount >= 5) { // 5x stable = domain benar-benar ready
+                    LOGI(OBFUSCATE("ThrowIO: assemblies stable — count=%zu"), count);
+                    dlclose(lib);
+                    return true;
+                }
             } else {
                 stableCount = 0;
             }
@@ -164,7 +187,7 @@ static bool WaitForAssembliesReady(int maxWaitMs = 20000) {
 }
 
 // ================================================================
-//  EGL / GL STATE VALIDATORS
+//  EGL / GL VALIDATORS
 // ================================================================
 static bool IsEGLContextCurrent() {
     EGLDisplay dpy = eglGetCurrentDisplay();
@@ -179,13 +202,10 @@ static bool IsGLReady() {
     GLint major = 0;
     glGetIntegerv(GL_MAJOR_VERSION, &major);
     if (glGetError() != GL_NO_ERROR || major < 2) return false;
-
     GLint vp[4] = {0};
     glGetIntegerv(GL_VIEWPORT, vp);
     if (glGetError() != GL_NO_ERROR || vp[2] <= 0 || vp[3] <= 0) return false;
-
-    glFlush();
-    glFinish();
+    glFlush(); glFinish();
     return glGetError() == GL_NO_ERROR;
 }
 
@@ -255,10 +275,8 @@ void hook_SaveLocal(void* inst) {
 // ================================================================
 static void ApplyImGuiStyle() {
     ImGuiStyle& st = ImGui::GetStyle();
-    st.WindowRounding    = 10.0f;
-    st.FrameRounding     =  5.0f;
-    st.ScrollbarRounding =  5.0f;
-    st.GrabRounding      =  4.0f;
+    st.WindowRounding    = 10.0f; st.FrameRounding     =  5.0f;
+    st.ScrollbarRounding =  5.0f; st.GrabRounding      =  4.0f;
     st.WindowPadding     = ImVec2(12, 12);
     st.ItemSpacing       = ImVec2( 8,  6);
 
@@ -277,7 +295,7 @@ static void ApplyImGuiStyle() {
 }
 
 // ================================================================
-//  IMGUI INIT — full GL + EGL validation
+//  IMGUI SAFE INIT
 // ================================================================
 static bool SafeSetupImGui(EGLDisplay dpy, EGLSurface surface) {
     if (!IsEGLContextCurrent()) return false;
@@ -298,7 +316,7 @@ static bool SafeSetupImGui(EGLDisplay dpy, EGLSurface surface) {
     if (!ImGui::GetCurrentContext()) return false;
 
     ApplyImGuiStyle();
-    LOGI(OBFUSCATE("ThrowIO: ImGui OK — ctx=%p"), g_savedContext);
+    LOGI(OBFUSCATE("ThrowIO: ImGui OK ctx=%p"), g_savedContext);
     return true;
 }
 
@@ -322,11 +340,8 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     glHeight = h;
 
     int frame = g_frameCount.fetch_add(1, std::memory_order_relaxed);
-
-    // 300 frame đầu = ~5s — đủ cho Unity splash xong
     if (frame < 300) return old_eglSwapBuffers(dpy, surface);
 
-    // Retry với backoff theo số lần fail
     if (g_imguiFailed.load(std::memory_order_acquire)) {
         int fails   = g_failCount.load(std::memory_order_relaxed);
         int retryAt = (fails < 3) ? 120 : (fails < 6) ? 240 : 360;
@@ -334,12 +349,11 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
         g_imguiFailed.store(false, std::memory_order_release);
         g_imguiSetup.store(false,  std::memory_order_release);
         g_eglReady.store(false,    std::memory_order_release);
-        LOGI(OBFUSCATE("ThrowIO: retry ImGui — frame=%d fails=%d"), frame, fails);
     }
 
     if (!g_imguiSetup.load(std::memory_order_acquire)) {
         if (SafeSetupImGui(dpy, surface)) {
-            g_failCount.store(0,    std::memory_order_relaxed);
+            g_failCount.store(0,     std::memory_order_relaxed);
             g_imguiSetup.store(true, std::memory_order_release);
             g_eglReady.store(true,   std::memory_order_release);
         } else {
@@ -367,7 +381,7 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     ImGui::Begin(OBFUSCATE("THROWIO MOD - AXIOM"), nullptr,
                  ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize);
 
-    ImGui::TextColored(ImVec4(0.0f, 0.8f, 1.0f, 1.0f), OBFUSCATE("  AXIOM DEVELOPMENT"));
+    ImGui::TextColored(ImVec4(0.0f,0.8f,1.0f,1.0f), OBFUSCATE("  AXIOM DEVELOPMENT"));
     ImGui::Separator(); ImGui::Spacing();
 
     bool connected = (g_BalanceInstance != nullptr);
@@ -391,7 +405,7 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     ImGui::Checkbox(OBFUSCATE("Tien Premium Vo Han"),   &SWITCH::InfinitePremium);
     ImGui::Checkbox(OBFUSCATE("Bo Quang Cao (No Ads)"), &SWITCH::NoAds);
     ImGui::Spacing();
-    if (ImGui::Button(OBFUSCATE("Cap Nhat Tien Ngay"), ImVec2(-1.0f, 36.0f)))
+    if (ImGui::Button(OBFUSCATE("Cap Nhat Tien Ngay"), ImVec2(-1.0f,36.0f)))
         SWITCH::ForceUpdateMoney = true;
 
     ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
@@ -401,7 +415,7 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     ImGui::Spacing();
     ImGui::Checkbox(OBFUSCATE("Max Level 99"), &SWITCH::MaxLevel);
     ImGui::Spacing();
-    if (ImGui::Button(OBFUSCATE("Len Cap Ngay"), ImVec2(-1.0f, 36.0f)))
+    if (ImGui::Button(OBFUSCATE("Len Cap Ngay"), ImVec2(-1.0f,36.0f)))
         SWITCH::ForceMaxLevel = true;
 
     ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
@@ -425,12 +439,9 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
 
     ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
 
-    // ── DEBUG ──────────────────────────────────────────────────
     ImGui::TextColored(ImVec4(0.4f,0.4f,0.4f,1.0f),
-        OBFUSCATE("frame:%d | ctx:%p | inst:%p"),
-        frame,
-        reinterpret_cast<void*>(g_savedContext),
-        g_BalanceInstance);
+        OBFUSCATE("frame:%d ctx:%p inst:%p"),
+        frame, reinterpret_cast<void*>(g_savedContext), g_BalanceInstance);
 
     ImGui::End();
     ImGui::Render();
@@ -447,31 +458,33 @@ JNI_OnLoad(JavaVM* vm, void* reserved) {
     JNIEnv* env = nullptr;
     if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK)
         return JNI_VERSION_1_6;
-
     LOGI(OBFUSCATE("ThrowIO: JNI_OnLoad OK"));
     return JNI_VERSION_1_6;
 }
 
 // ================================================================
 //  HACK THREAD
-//  FIX: Không dùng BNM::Method<> — dùng getOffset + AddPointer
-//  BNM::Method<> không có trong version này, LoadClass -> void* ambiguous
 // ================================================================
 void* hack_thread(void*) {
     do { sleep(1); } while (!isLibraryLoaded(targetLibName));
     address = findLibrary(targetLibName);
     LOGI(OBFUSCATE("ThrowIO: il2cpp @ %p"), reinterpret_cast<void*>(address));
 
-    usleep(1500000); // 1.5s buffer — domain init async
+    // Buffer 3s — domain init async, lebih aman dari 1.5s
+    usleep(3000000);
 
-    if (!WaitForAssembliesReady(20000)) {
-        LOGE(OBFUSCATE("ThrowIO: assemblies never ready — bail"));
+    if (!WaitForAssembliesReady(30000)) {
+        LOGE(OBFUSCATE("ThrowIO: assemblies never stable — bail"));
         return nullptr;
     }
 
-    // ── Attach dengan retry + class probe validation ───────────
+    // Tambah buffer 1s setelah assemblies stable
+    // Method table butuh waktu setelah assembly list ready
+    usleep(1000000);
+
+    // ── Attach + class probe validation ───────────────────────
     bool attached = false;
-    for (int attempt = 0; attempt < 5 && !attached; attempt++) {
+    for (int attempt = 0; attempt < 8 && !attached; attempt++) {
         std::atomic_thread_fence(std::memory_order_seq_cst);
         AttachIl2Cpp();
 
@@ -487,7 +500,7 @@ void* hack_thread(void*) {
     }
 
     if (!attached) {
-        LOGE(OBFUSCATE("ThrowIO: FATAL — attach failed"));
+        LOGE(OBFUSCATE("ThrowIO: FATAL — attach failed all attempts"));
         return nullptr;
     }
 
@@ -497,22 +510,14 @@ void* hack_thread(void*) {
     BNM::LoadClass playerDataClass = getClass(OBFUSCATE("PlayerData"),    OBFUSCATE("ThrowIO"));
     BNM::LoadClass charWeaponClass = getClass(OBFUSCATE("CharWeapon"),    OBFUSCATE("ThrowIO"));
 
-    LOGI(OBFUSCATE("Classes: bal=%p char=%p pdata=%p cwep=%p"),
-         balanceClass, charClass, playerDataClass, charWeaponClass);
-
-    // ================================================================
-    //  FIX UTAMA: auto generic lambda — tránh ambiguous void* cast
-    //  BNM::LoadClass có 2 conversion operator (Il2CppType* & MonoType*)
-    //  void* cls → compiler không biết chọn cái nào → 13 lỗi
-    //  auto cls  → compiler deduce exact LoadClass type → build clean
-    // ================================================================
+    // ── auto lambda — tránh LoadClass → void* ambiguous conv ──
     auto safe_offset = [](auto cls, const char* name) -> uintptr_t {
         if (!cls) {
             LOGE(OBFUSCATE("ThrowIO: null class for %s"), name);
             return 0;
         }
         auto off = getOffset(cls, name);
-        if (!off) LOGE(OBFUSCATE("ThrowIO: offset not found: %s"), name);
+        if (!off) LOGE(OBFUSCATE("ThrowIO: offset missing: %s"), name);
         return off;
     };
 
@@ -529,40 +534,104 @@ void* hack_thread(void*) {
     auto off_cwUpdate     = safe_offset(charWeaponClass, OBFUSCATE("update"));
     auto off_saveLocal    = safe_offset(playerDataClass, OBFUSCATE("SaveLocal"));
 
-    LOGI(OBFUSCATE("Off: SM=%p HM=%p LV=%p EX=%p AD=%p SD=%p CW=%p SL=%p"),
-         reinterpret_cast<void*>(off_setSoftMoney),
-         reinterpret_cast<void*>(off_setHardMoney),
-         reinterpret_cast<void*>(off_setLevel),
-         reinterpret_cast<void*>(off_setExp),
-         reinterpret_cast<void*>(off_applyDamage),
-         reinterpret_cast<void*>(off_setDeath),
-         reinterpret_cast<void*>(off_cwUpdate),
-         reinterpret_cast<void*>(off_saveLocal));
+    // ================================================================
+    //  FIX UTAMA v5: Log + validate SETIAP offset trước khi pakai
+    //  0xec1e3d49xx bukan userspace — IsValidOffset() nolak address itu
+    //  Tanpa ini DHK() langsung crash karena Dobby tulis ke unmapped page
+    // ================================================================
+    LOGI(OBFUSCATE("Offsets raw: SM=0x%lx HM=0x%lx LV=0x%lx EX=0x%lx AD=0x%lx SD=0x%lx CW=0x%lx SL=0x%lx"),
+         (unsigned long)off_setSoftMoney, (unsigned long)off_setHardMoney,
+         (unsigned long)off_setLevel,     (unsigned long)off_setExp,
+         (unsigned long)off_applyDamage,  (unsigned long)off_setDeath,
+         (unsigned long)off_cwUpdate,     (unsigned long)off_saveLocal);
 
-    // ── AddPointer — bind offset ke function pointer ───────────
-    if (off_setSoftMoney) AddPointer(set_SoftMoney, off_setSoftMoney);
-    if (off_setHardMoney) AddPointer(set_HardMoney, off_setHardMoney);
-    if (off_setLevel)     AddPointer(set_Level,     off_setLevel);
-    if (off_setExp)       AddPointer(set_Exp,       off_setExp);
-    if (off_setNoAds)     AddPointer(set_NoAds,     off_setNoAds);
-    if (off_getSoftMoney) AddPointer(get_SoftMoney, off_getSoftMoney);
-    if (off_getHardMoney) AddPointer(get_HardMoney, off_getHardMoney);
-    if (off_getLevel)     AddPointer(get_Level,     off_getLevel);
+    // Validate semua offset — tolak yang bukan userspace
+    bool allOffsetsValid =
+        IsValidOffset(off_setSoftMoney) &&
+        IsValidOffset(off_applyDamage)  &&
+        IsValidOffset(off_setDeath)     &&
+        IsValidOffset(off_cwUpdate)     &&
+        IsValidOffset(off_saveLocal);
+
+    if (!allOffsetsValid) {
+        // Method table belum mapped — retry setelah 3s
+        LOGE(OBFUSCATE("ThrowIO: offsets invalid (0xec... garbage) — method table not ready, retry 3s"));
+        DetachIl2Cpp();
+
+        for (int retry = 0; retry < 5; retry++) {
+            usleep(3000000); // 3s per retry
+
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            AttachIl2Cpp();
+
+            balanceClass    = getClass(OBFUSCATE("PlayerBalance"), OBFUSCATE("ThrowIO"));
+            charClass       = getClass(OBFUSCATE("Character"),     OBFUSCATE("ThrowIO"));
+            playerDataClass = getClass(OBFUSCATE("PlayerData"),    OBFUSCATE("ThrowIO"));
+            charWeaponClass = getClass(OBFUSCATE("CharWeapon"),    OBFUSCATE("ThrowIO"));
+
+            off_setSoftMoney = safe_offset(balanceClass,    OBFUSCATE("set_SoftMoney"));
+            off_setHardMoney = safe_offset(balanceClass,    OBFUSCATE("set_HardMoney"));
+            off_setLevel     = safe_offset(balanceClass,    OBFUSCATE("set_Level"));
+            off_setExp       = safe_offset(balanceClass,    OBFUSCATE("set_Exp"));
+            off_setNoAds     = safe_offset(balanceClass,    OBFUSCATE("set_NoAds"));
+            off_getSoftMoney = safe_offset(balanceClass,    OBFUSCATE("get_SoftMoney"));
+            off_getHardMoney = safe_offset(balanceClass,    OBFUSCATE("get_HardMoney"));
+            off_getLevel     = safe_offset(balanceClass,    OBFUSCATE("get_Level"));
+            off_applyDamage  = safe_offset(charClass,       OBFUSCATE("ApplyDamage"));
+            off_setDeath     = safe_offset(charClass,       OBFUSCATE("SetDeath"));
+            off_cwUpdate     = safe_offset(charWeaponClass, OBFUSCATE("update"));
+            off_saveLocal    = safe_offset(playerDataClass, OBFUSCATE("SaveLocal"));
+
+            LOGI(OBFUSCATE("Retry %d offsets: SM=0x%lx AD=0x%lx SD=0x%lx"),
+                 retry,
+                 (unsigned long)off_setSoftMoney,
+                 (unsigned long)off_applyDamage,
+                 (unsigned long)off_setDeath);
+
+            allOffsetsValid =
+                IsValidOffset(off_setSoftMoney) &&
+                IsValidOffset(off_applyDamage)  &&
+                IsValidOffset(off_setDeath)      &&
+                IsValidOffset(off_cwUpdate)      &&
+                IsValidOffset(off_saveLocal);
+
+            if (allOffsetsValid) {
+                LOGI(OBFUSCATE("ThrowIO: offsets valid after retry %d — fuck yeah"), retry);
+                break;
+            }
+
+            DetachIl2Cpp();
+        }
+
+        if (!allOffsetsValid) {
+            LOGE(OBFUSCATE("ThrowIO: FATAL — offsets still garbage after all retries"));
+            DetachIl2Cpp();
+            return nullptr;
+        }
+    }
+
+    // ── AddPointer — offset validated, aman dipakai ───────────
+    if (IsValidOffset(off_setSoftMoney)) AddPointer(set_SoftMoney, off_setSoftMoney);
+    if (IsValidOffset(off_setHardMoney)) AddPointer(set_HardMoney, off_setHardMoney);
+    if (IsValidOffset(off_setLevel))     AddPointer(set_Level,     off_setLevel);
+    if (IsValidOffset(off_setExp))       AddPointer(set_Exp,       off_setExp);
+    if (IsValidOffset(off_setNoAds))     AddPointer(set_NoAds,     off_setNoAds);
+    if (IsValidOffset(off_getSoftMoney)) AddPointer(get_SoftMoney, off_getSoftMoney);
+    if (IsValidOffset(off_getHardMoney)) AddPointer(get_HardMoney, off_getHardMoney);
+    if (IsValidOffset(off_getLevel))     AddPointer(get_Level,     off_getLevel);
 
     DetachIl2Cpp();
-
-    // Fence — semua pointer writes visible sebelum hook dipasang
     std::atomic_thread_fence(std::memory_order_seq_cst);
 
-    // ── DobbyHook install ──────────────────────────────────────
-    if (off_setSoftMoney) DHK(off_setSoftMoney, capture_set_SoftMoney,  orig_set_SoftMoney);
-    if (off_applyDamage)  DHK(off_applyDamage,  hook_ApplyDamage,       old_ApplyDamage);
-    if (off_setDeath)     DHK(off_setDeath,      hook_SetDeath,          old_SetDeath);
-    if (off_cwUpdate)     DHK(off_cwUpdate,      hook_CharWeapon_update, old_CharWeapon_update);
-    if (off_saveLocal)    DHK(off_saveLocal,      hook_SaveLocal,         old_SaveLocal);
+    // ── DHK — hanya jika offset valid, Dobby tidak crash ──────
+    if (IsValidOffset(off_setSoftMoney)) DHK(off_setSoftMoney, capture_set_SoftMoney,  orig_set_SoftMoney);
+    if (IsValidOffset(off_applyDamage))  DHK(off_applyDamage,  hook_ApplyDamage,       old_ApplyDamage);
+    if (IsValidOffset(off_setDeath))     DHK(off_setDeath,      hook_SetDeath,          old_SetDeath);
+    if (IsValidOffset(off_cwUpdate))     DHK(off_cwUpdate,      hook_CharWeapon_update, old_CharWeapon_update);
+    if (IsValidOffset(off_saveLocal))    DHK(off_saveLocal,      hook_SaveLocal,         old_SaveLocal);
 
     g_hooksReady.store(true, std::memory_order_release);
-    LOGI(OBFUSCATE("ThrowIO: All hooks live — fuck yeah"));
+    LOGI(OBFUSCATE("ThrowIO: All hooks live — that's what the hell is going on"));
     return nullptr;
 }
 
@@ -574,7 +643,6 @@ void lib_main() {
     InitCrashLogger();
     LOGI(OBFUSCATE("ThrowIO: lib_main start"));
 
-    // EGL dlopen với retry backoff
     void* eglhandle = nullptr;
     for (int retry = 0; retry < 30 && !eglhandle; retry++) {
         eglhandle = dlopen(OBFUSCATE("libEGL.so"), RTLD_NOW | RTLD_GLOBAL);
@@ -584,21 +652,14 @@ void lib_main() {
         }
     }
 
-    if (!eglhandle) {
-        LOGE(OBFUSCATE("ThrowIO: FATAL — libEGL.so unavailable"));
-        return;
-    }
+    if (!eglhandle) { LOGE(OBFUSCATE("ThrowIO: FATAL — libEGL.so")); return; }
 
     void* eglSwapSym = dlsym(eglhandle, OBFUSCATE("eglSwapBuffers"));
-    if (!eglSwapSym) {
-        LOGE(OBFUSCATE("ThrowIO: FATAL — eglSwapBuffers missing"));
-        return;
-    }
+    if (!eglSwapSym) { LOGE(OBFUSCATE("ThrowIO: FATAL — eglSwapBuffers")); return; }
 
     DHK(eglSwapSym, hook_eglSwapBuffers, old_eglSwapBuffers);
     LOGI(OBFUSCATE("ThrowIO: eglSwapBuffers hooked -> %p"), eglSwapSym);
 
-    // 4MB stack — BNM class scan cần nhiều stack
     pthread_t      ptid;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
