@@ -1,15 +1,21 @@
 // ================================================================
 //  THROWIO MOD - AXIOM DEVELOPMENT
-//  CRASH FIX v3 — SIGSEGV 0x0 @ BNM attach
+//  CRASH FIX v4 — SIGSEGV TID MISMATCH + IMGUI UNPROTECTED
 //
-//  ROOT CAUSE:
-//    - assemblies list tồn tại nhưng entries chưa populated
-//    - BNM deref entry → 0x0 → SIGSEGV
+//  ROOT CAUSE (thật sự):
+//    - Crash TID 17540 = Unity render thread chạy hook_eglSwapBuffers
+//    - sigsetjmp set ở TID 17511 (hack_thread) → bảo vệ SAI THREAD
+//    - siglongjmp cross-thread = UB → crash thêm lần nữa
+//    - SetupImGui() gọi từ render thread không có bảo vệ gì
+//    - SA_RESETHAND reset sau signal đầu → attempt 2+ không catch được
 //
-//  FIXES v3:
-//    [1] usleep 2s → 5s cho assemblies populate
-//    [2] sigsetjmp wrap quanh AttachIl2Cpp → crash bị bắt, retry
-//    [3] Delay tăng dần per attempt (1s → 2s → 3s)
+//  FIXES v4:
+//    [1] thread_local sigjmp_buf — mỗi thread tự bảo vệ mình
+//    [2] Signal guard wrap quanh SafeSetupImGui trong render thread
+//    [3] RTLD_NOW|RTLD_NOLOAD → chỉ RTLD_NOLOAD
+//    [4] SA_RESETHAND bỏ → dùng SA_SIGINFO để giữ handler
+//    [5] Frame threshold tăng 90→150 cho EGL stable hơn
+//    [6] Double-check EGL surface dim trước khi ImGui init
 // ================================================================
 
 #include <GLES3/gl3.h>
@@ -21,6 +27,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <atomic>
+#include <pthread.h>
 
 // ================================================================
 //  FUNCTION POINTERS
@@ -72,29 +79,74 @@ static EGLContext g_savedContext = EGL_NO_CONTEXT;
 EGLBoolean (*old_eglSwapBuffers)(EGLDisplay, EGLSurface) = nullptr;
 
 // ================================================================
-//  [FIX v3] BNM CRASH PROTECTION - sigsetjmp
+//  [FIX v4] THREAD-LOCAL sigjmp_buf
+//  Bug cũ: global g_bnm_jmp → siglongjmp cross-thread = UB
+//  Fix: mỗi thread có jmp_buf riêng → longjmp đúng stack
 // ================================================================
-static sigjmp_buf  g_bnm_jmp;
-static volatile bool g_bnm_crashed = false;
+static thread_local sigjmp_buf  tl_crash_jmp;
+static thread_local volatile bool tl_in_guard = false;
 
-static void BNM_CrashHandler(int sig) {
-    g_bnm_crashed = true;
-    siglongjmp(g_bnm_jmp, 1);
+// Signal handler — chỉ longjmp nếu thread này đang trong guard
+static void ThreadSafeCrashHandler(int sig, siginfo_t* info, void* ctx) {
+    if (tl_in_guard) {
+        tl_in_guard = false;
+        siglongjmp(tl_crash_jmp, 1);
+    }
+    // Thread khác crash → abort gracefully
+    LOGE(OBFUSCATE("ThrowIO: unguarded SIGSEGV sig=%d — thread không trong guard"), sig);
 }
 
 // ================================================================
-//  IsValidPtr
+//  Signal Guard Scope Helper
+//  Dùng cho BẤT KỲ thread nào cần protect, không chỉ hack_thread
+// ================================================================
+struct SignalGuard {
+    struct sigaction old_sa_segv;
+    struct sigaction old_sa_bus;
+    bool active = false;
+
+    bool install() {
+        struct sigaction sa;
+        sa.sa_sigaction = ThreadSafeCrashHandler;
+        // [FIX] Bỏ SA_RESETHAND — handler giữ nguyên sau signal
+        sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigemptyset(&sa.sa_mask);
+
+        if (sigaction(SIGSEGV, &sa, &old_sa_segv) != 0) return false;
+        if (sigaction(SIGBUS,  &sa, &old_sa_bus)  != 0) {
+            sigaction(SIGSEGV, &old_sa_segv, nullptr);
+            return false;
+        }
+        tl_in_guard = true;
+        active = true;
+        return true;
+    }
+
+    void restore() {
+        if (!active) return;
+        tl_in_guard = false;
+        sigaction(SIGSEGV, &old_sa_segv, nullptr);
+        sigaction(SIGBUS,  &old_sa_bus,  nullptr);
+        active = false;
+    }
+
+    ~SignalGuard() { restore(); }
+};
+
+// ================================================================
+//  IsValidPtr — dùng mincore, validate user-space range
 // ================================================================
 static bool IsValidPtr(const void* ptr, size_t sz = sizeof(void*)) {
     if (!ptr) return false;
-    if (reinterpret_cast<uintptr_t>(ptr) > 0x7fffffffffffULL) return false;
+    uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+    if (addr < 0x10000ULL)            return false;
+    if (addr > 0x7fffffffffffULL)     return false;
+    if (addr & 0x1)                   return false;
 
     long pageSize = sysconf(_SC_PAGESIZE);
     if (pageSize <= 0) pageSize = 4096;
 
-    uintptr_t page = reinterpret_cast<uintptr_t>(ptr)
-                     & ~static_cast<uintptr_t>(pageSize - 1);
-
+    uintptr_t page = addr & ~static_cast<uintptr_t>(pageSize - 1);
     size_t alignedSz = (sz + static_cast<size_t>(pageSize) - 1)
                        & ~static_cast<size_t>(pageSize - 1);
     if (alignedSz == 0) alignedSz = static_cast<size_t>(pageSize);
@@ -126,24 +178,13 @@ static bool IsGLReady() {
 
     GLint major = 0;
     glGetIntegerv(GL_MAJOR_VERSION, &major);
-
-    GLenum err = glGetError();
-    if (err != GL_NO_ERROR) {
-        LOGE(OBFUSCATE("ThrowIO: GL not ready — err=0x%x"), err);
-        return false;
-    }
-    if (major < 2) {
-        LOGE(OBFUSCATE("ThrowIO: GL version too low — major=%d"), major);
-        return false;
-    }
+    if (glGetError() != GL_NO_ERROR || major < 2) return false;
 
     GLint viewport[4] = {0};
     glGetIntegerv(GL_VIEWPORT, viewport);
-    if (glGetError() != GL_NO_ERROR || viewport[2] <= 0 || viewport[3] <= 0) {
-        LOGE(OBFUSCATE("ThrowIO: GL viewport invalid [%d %d %d %d]"),
-             viewport[0], viewport[1], viewport[2], viewport[3]);
+    if (glGetError() != GL_NO_ERROR || viewport[2] <= 0 || viewport[3] <= 0)
         return false;
-    }
+
     return true;
 }
 
@@ -218,7 +259,9 @@ static void ApplyImGuiStyle() {
 }
 
 // ================================================================
-//  SafeSetupImGui
+//  [FIX v4] SafeSetupImGui — giờ có SignalGuard cho render thread
+//  Bug cũ: SetupImGui() gọi từ TID 17540 không có bảo vệ gì
+//  Fix: wrap SetupImGui() bằng SignalGuard thread-local
 // ================================================================
 static bool SafeSetupImGui(EGLDisplay dpy, EGLSurface surface) {
     if (!IsEGLContextCurrent()) {
@@ -230,12 +273,43 @@ static bool SafeSetupImGui(EGLDisplay dpy, EGLSurface surface) {
         return false;
     }
 
+    // [FIX v4] Extra check: surface dimension từ EGL query
+    EGLint w = 0, h = 0;
+    if (eglQuerySurface(dpy, surface, EGL_WIDTH,  &w) != EGL_TRUE ||
+        eglQuerySurface(dpy, surface, EGL_HEIGHT, &h) != EGL_TRUE ||
+        w <= 0 || h <= 0) {
+        LOGE(OBFUSCATE("ThrowIO: SafeSetupImGui — surface dim invalid %dx%d"), w, h);
+        return false;
+    }
+
     g_savedDisplay = eglGetCurrentDisplay();
     g_savedContext = eglGetCurrentContext();
-
     while (glGetError() != GL_NO_ERROR) {}
 
-    SetupImGui();
+    // ── [FIX v4] Wrap SetupImGui() với signal guard ────────────────
+    // Render thread (TID 17540) giờ tự bảo vệ mình
+    bool setupOk = false;
+    {
+        SignalGuard guard;
+        if (!guard.install()) {
+            LOGE(OBFUSCATE("ThrowIO: SignalGuard install failed — skip ImGui init"));
+            return false;
+        }
+
+        if (sigsetjmp(tl_crash_jmp, 1) == 0) {
+            // Thử SetupImGui trong guard
+            SetupImGui();
+            setupOk = true;
+        } else {
+            // Crash bị bắt ngay trong render thread
+            LOGE(OBFUSCATE("ThrowIO: SetupImGui CRASH bị bắt — render thread safe"));
+            guard.restore();
+            return false;
+        }
+        guard.restore();
+    }
+
+    if (!setupOk) return false;
 
     ImGuiContext* imCtx = ImGui::GetCurrentContext();
     if (!imCtx) {
@@ -250,8 +324,8 @@ static bool SafeSetupImGui(EGLDisplay dpy, EGLSurface surface) {
     }
 
     ApplyImGuiStyle();
-    LOGI(OBFUSCATE("ThrowIO: ImGui setup OK ctx=%p dpy=%p"),
-         g_savedContext, g_savedDisplay);
+    LOGI(OBFUSCATE("ThrowIO: ImGui setup OK ctx=%p dpy=%p dim=%dx%d"),
+         g_savedContext, g_savedDisplay, w, h);
     return true;
 }
 
@@ -260,6 +334,7 @@ static bool SafeSetupImGui(EGLDisplay dpy, EGLSurface surface) {
 // ================================================================
 EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     if (!old_eglSwapBuffers) return EGL_FALSE;
+
     if (dpy == EGL_NO_DISPLAY || surface == EGL_NO_SURFACE)
         return old_eglSwapBuffers(dpy, surface);
     if (eglGetCurrentContext() == EGL_NO_CONTEXT)
@@ -269,18 +344,19 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     if (eglQuerySurface(dpy, surface, EGL_WIDTH,  &w) != EGL_TRUE ||
         eglQuerySurface(dpy, surface, EGL_HEIGHT, &h) != EGL_TRUE)
         return old_eglSwapBuffers(dpy, surface);
-
     if (w <= 0 || h <= 0) return old_eglSwapBuffers(dpy, surface);
 
     glWidth  = w;
     glHeight = h;
 
     int frame = g_frameCount.fetch_add(1, std::memory_order_relaxed);
-    if (frame < 90) return old_eglSwapBuffers(dpy, surface);
+
+    // [FIX v4] Tăng 90 → 150 — cho EGL context stable hơn trước khi setup ImGui
+    if (frame < 150) return old_eglSwapBuffers(dpy, surface);
 
     if (g_imguiFailed.load(std::memory_order_acquire)) {
         int fails = g_failCount.load(std::memory_order_relaxed);
-        int retryInterval = (fails < 3) ? 60 : (fails < 6) ? 120 : 180;
+        int retryInterval = (fails < 3) ? 90 : (fails < 6) ? 150 : 240;
         if (frame % retryInterval != 0) return old_eglSwapBuffers(dpy, surface);
         LOGI(OBFUSCATE("ThrowIO: retry ImGui — frame=%d fail#%d"), frame, fails);
         g_imguiFailed.store(false, std::memory_order_release);
@@ -305,7 +381,7 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
         return old_eglSwapBuffers(dpy, surface);
 
     if (!IsEGLContextCurrent()) {
-        LOGE(OBFUSCATE("ThrowIO: EGL context lost frame=%d reset"), frame);
+        LOGE(OBFUSCATE("ThrowIO: EGL context lost frame=%d — reset"), frame);
         g_imguiSetup.store(false, std::memory_order_release);
         g_eglReady.store(false,   std::memory_order_release);
         g_savedContext = EGL_NO_CONTEXT;
@@ -315,7 +391,7 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
 
     ImGuiContext* imCtx = ImGui::GetCurrentContext();
     if (!imCtx) {
-        LOGE(OBFUSCATE("ThrowIO: ImGui ctx null reset"));
+        LOGE(OBFUSCATE("ThrowIO: ImGui ctx null — reset"));
         g_imguiSetup.store(false, std::memory_order_release);
         g_eglReady.store(false,   std::memory_order_release);
         return old_eglSwapBuffers(dpy, surface);
@@ -356,7 +432,6 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
 
     ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
 
-    // ============ TIỀN TỆ ============
     ImGui::TextColored(ImVec4(1.0f,0.75f,0.0f,1.0f), OBFUSCATE(" TIEN TE"));
     ImGui::Spacing();
     ImGui::Checkbox(OBFUSCATE("Tien Mem Vo Han"),       &SWITCH::InfiniteMoney);
@@ -373,7 +448,6 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
 
     ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
 
-    // ============ TIẾN TRÌNH ============
     ImGui::TextColored(ImVec4(1.0f,0.75f,0.0f,1.0f), OBFUSCATE(" TIEN TRINH"));
     ImGui::Spacing();
     ImGui::Checkbox(OBFUSCATE("Max Level 99"), &SWITCH::MaxLevel);
@@ -388,7 +462,6 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
 
     ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
 
-    // ============ CHIẾN ĐẤU ============
     ImGui::TextColored(ImVec4(1.0f,0.75f,0.0f,1.0f), OBFUSCATE(" CHIEN DAU"));
     ImGui::Spacing();
     ImGui::Checkbox(OBFUSCATE("God Mode (Bat Tu)"), &SWITCH::GodMode);
@@ -400,18 +473,15 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
 
     ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
 
-    // ============ BẢO MẬT ============
     ImGui::TextColored(ImVec4(1.0f,0.75f,0.0f,1.0f), OBFUSCATE(" BAO MAT"));
     ImGui::Spacing();
     ImGui::Checkbox(OBFUSCATE("Bypass Anti-Cheat"), &SWITCH::AntiCheat);
 
     ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
 
-    // ============ DEBUG INFO ============
     ImGui::TextColored(ImVec4(0.4f,0.4f,0.4f,1.0f),
         OBFUSCATE("frame=%d | inst=%p | retry=%d"),
-        frame,
-        g_BalanceInstance,
+        frame, g_BalanceInstance,
         g_failCount.load(std::memory_order_relaxed)
     );
 
@@ -458,10 +528,14 @@ JNI_OnLoad(JavaVM* vm, void* reserved) {
 
 // ================================================================
 //  WaitForIl2CppDomainReady
+//  [FIX v4] RTLD_NOW|RTLD_NOLOAD → chỉ RTLD_NOLOAD
+//  RTLD_NOW trên lib đã load là redundant và có thể gây side effect
 // ================================================================
 static bool WaitForIl2CppDomainReady(uintptr_t baseAddr, int maxWaitMs = 5000) {
     typedef void* (*domain_get_fn)();
-    void* libHandle = dlopen(OBFUSCATE("libil2cpp.so"), RTLD_NOW | RTLD_NOLOAD);
+
+    // [FIX] Chỉ RTLD_NOLOAD — không relocate lại
+    void* libHandle = dlopen(OBFUSCATE("libil2cpp.so"), RTLD_NOLOAD);
     if (!libHandle) {
         usleep(static_cast<useconds_t>(maxWaitMs) * 1000);
         return true;
@@ -496,7 +570,7 @@ static bool WaitForIl2CppDomainReady(uintptr_t baseAddr, int maxWaitMs = 5000) {
 }
 
 // ================================================================
-//  HACK THREAD
+//  HACK THREAD — [FIX v4] SignalGuard đúng cách
 // ================================================================
 void* hack_thread(void*) {
     do { sleep(1); } while (!isLibraryLoaded(targetLibName));
@@ -504,18 +578,12 @@ void* hack_thread(void*) {
     LOGI(OBFUSCATE("ThrowIO: il2cpp detected @ %p"),
          reinterpret_cast<void*>(address));
 
-    usleep(1500000); // 1.5s initial delay
+    usleep(1500000);
 
-    // Poll domain ptr
     WaitForIl2CppDomainReady(address, 3000);
 
-    // ================================================================
-    //  [FIX v3] 5 GIÂY thay vì 2 giây
-    //  Domain ptr valid != assemblies populated
-    //  Cần đủ thời gian để Unity populate assembly entries
-    // ================================================================
     LOGI(OBFUSCATE("ThrowIO: domain ptr valid — waiting 5s for assemblies populate..."));
-    usleep(5000000); // [FIX] 5s thay vì 2s
+    usleep(5000000);
     LOGI(OBFUSCATE("ThrowIO: assemblies buffer done — proceeding to BNM attach"));
 
     bool attached = false;
@@ -523,20 +591,17 @@ void* hack_thread(void*) {
     for (int attempt = 0; attempt < 15 && !attached; attempt++) {
         std::atomic_thread_fence(std::memory_order_seq_cst);
 
-        // ================================================================
-        //  [FIX v3] SIGSETJMP PROTECTION
-        //  Nếu BNM crash → bắt được, retry tiếp
-        // ================================================================
-        struct sigaction sa, old_sa;
-        sa.sa_handler = BNM_CrashHandler;
-        sa.sa_flags   = SA_RESETHAND;
-        sigemptyset(&sa.sa_mask);
-        sigaction(SIGSEGV, &sa, &old_sa);
+        // ── [FIX v4] Dùng SignalGuard thay vì manual sigaction ───────
+        // Thread-local jmp_buf — không cross-thread nữa
+        SignalGuard guard;
+        if (!guard.install()) {
+            LOGE(OBFUSCATE("ThrowIO: guard install fail attempt %d"), attempt);
+            usleep(1000000);
+            continue;
+        }
 
-        g_bnm_crashed = false;
-
-        if (sigsetjmp(g_bnm_jmp, 1) == 0) {
-            // Thử attach
+        bool crashed = false;
+        if (sigsetjmp(tl_crash_jmp, 1) == 0) {
             LOGI(OBFUSCATE("ThrowIO: BNM attach attempt %d..."), attempt);
             AttachIl2Cpp();
 
@@ -549,19 +614,17 @@ void* hack_thread(void*) {
                 DetachIl2Cpp();
             }
         } else {
-            // Crash bị bắt → retry
+            crashed = true;
             LOGE(OBFUSCATE("ThrowIO: CRASH CAUGHT attempt %d — retry"), attempt);
             DetachIl2Cpp();
         }
 
-        // Restore signal handler gốc
-        sigaction(SIGSEGV, &old_sa, nullptr);
+        guard.restore();
 
         if (!attached) {
-            // [FIX v3] Delay tăng dần per attempt
-            int delayUs = attempt < 3  ? 1000000 :  // 1.0s
-                          attempt < 7  ? 2000000 :  // 2.0s
-                                         3000000;   // 3.0s
+            int delayUs = attempt < 3  ? 1000000 :
+                          attempt < 7  ? 2000000 :
+                                         3000000;
             LOGI(OBFUSCATE("ThrowIO: retry in %dms"), delayUs / 1000);
             usleep(delayUs);
         }
@@ -573,7 +636,7 @@ void* hack_thread(void*) {
     }
 
     // ================================================================
-    //  BNM: LẤY OFFSET BẰNG TÊN
+    //  BNM: OFFSETS
     // ================================================================
     Menu::Screen_get_height = reinterpret_cast<int(*)()>(
         OBFBNM("UnityEngine", "Screen", "get_height", 0));
@@ -589,14 +652,10 @@ void* hack_thread(void*) {
          (bool)balanceClass, (bool)charClass,
          (bool)playerDataClass, (bool)charWeaponClass);
 
-    // Helper log offset
     auto safe_offset = [](BNM::LoadClass cls, const char* name) -> uintptr_t {
-        if (!cls) {
-            LOGE(OBFUSCATE("ThrowIO: null class for [%s]"), name);
-            return 0;
-        }
+        if (!cls) { LOGE(OBFUSCATE("ThrowIO: null class [%s]"), name); return 0; }
         uintptr_t off = getOffset(cls, name, 0);
-        if (!off) LOGE(OBFUSCATE("ThrowIO: offset=0 for [%s]"), name);
+        if (!off) LOGE(OBFUSCATE("ThrowIO: offset=0 [%s]"), name);
         else      LOGI(OBFUSCATE("ThrowIO: [%s] = 0x%lx"), name, (unsigned long)off);
         return off;
     };
@@ -624,12 +683,8 @@ void* hack_thread(void*) {
     if (off_getLevel)     AddPointer(get_Level,     off_getLevel);
 
     DetachIl2Cpp();
-
     std::atomic_thread_fence(std::memory_order_seq_cst);
 
-    // ================================================================
-    //  INSTALL HOOKS
-    // ================================================================
     if (off_setSoftMoney) DHK(off_setSoftMoney, capture_set_SoftMoney,  orig_set_SoftMoney);
     if (off_applyDamage)  DHK(off_applyDamage,  hook_ApplyDamage,       old_ApplyDamage);
     if (off_setDeath)     DHK(off_setDeath,      hook_SetDeath,          old_SetDeath);
@@ -637,7 +692,7 @@ void* hack_thread(void*) {
     if (off_saveLocal)    DHK(off_saveLocal,      hook_SaveLocal,         old_SaveLocal);
 
     g_hooksReady.store(true, std::memory_order_release);
-    LOGI(OBFUSCATE("ThrowIO: all hooks live — AXIOM MOD READY boss man"));
+    LOGI(OBFUSCATE("ThrowIO: fuck yeah — all hooks live, AXIOM MOD READY boss man"));
     return nullptr;
 }
 
@@ -678,10 +733,9 @@ void lib_main() {
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     pthread_attr_setstacksize(&attr, 4 * 1024 * 1024);
 
-    if (pthread_create(&ptid, &attr, hack_thread, nullptr) != 0) {
+    if (pthread_create(&ptid, &attr, hack_thread, nullptr) != 0)
         LOGE(OBFUSCATE("ThrowIO: pthread_create failed"));
-    }
-    pthread_attr_destroy(&attr);
 
+    pthread_attr_destroy(&attr);
     LOGI(OBFUSCATE("ThrowIO: lib_main done — thread launched"));
 }
