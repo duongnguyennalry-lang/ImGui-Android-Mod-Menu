@@ -1,8 +1,9 @@
 #include "MainHeader.h"
+#include "CrashLogger.h" // <-- THÊM VÀO
 
 // ================================================================
 //  THROWIO MOD - AXIOM DEVELOPMENT
-//  FIX: EGL race condition, null-safe hooks, deferred ImGui init
+//  FIX: EGL race condition + CrashLogger integrated
 // ================================================================
 
 void (*set_SoftMoney)(void* instance, long value);
@@ -39,12 +40,10 @@ namespace SWITCH {
 void*  g_BalanceInstance = nullptr;
 float  speedMultiplier   = 2.0f;
 
-// FIX: frame counter — defer ImGui init until surface is stable
 static std::atomic<int>  g_frameCount{0};
 static std::atomic<bool> g_eglReady{false};
 static std::atomic<bool> g_imguiSetup{false};
 
-// FIX: EGL hook pointer declared properly
 EGLBoolean (*old_eglSwapBuffers)(EGLDisplay, EGLSurface) = nullptr;
 
 // ================================================================
@@ -104,7 +103,7 @@ void hook_SaveLocal(void* instance) {
 }
 
 // ================================================================
-//  FIX: Safe ImGui style setup — call once per context
+//  ImGui Style
 // ================================================================
 static void ApplyImGuiStyle() {
     ImGuiStyle& st = ImGui::GetStyle();
@@ -130,19 +129,15 @@ static void ApplyImGuiStyle() {
 }
 
 // ================================================================
-//  HOOK: eglSwapBuffers — main render loop
-//  FIX: deferred init, frame-gated setup, null-safe teardown
+//  HOOK: eglSwapBuffers
 // ================================================================
 EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
-    // FIX: bail early if trampoline not ready
     if (!old_eglSwapBuffers) return EGL_FALSE;
 
-    // FIX: query dimensions every frame (handles rotation/resize)
     EGLint w = 0, h = 0;
     eglQuerySurface(dpy, surface, EGL_WIDTH,  &w);
     eglQuerySurface(dpy, surface, EGL_HEIGHT, &h);
 
-    // FIX: don't try to render on a zero-size surface
     if (w <= 0 || h <= 0) return old_eglSwapBuffers(dpy, surface);
 
     glWidth  = w;
@@ -150,7 +145,6 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
 
     int frame = g_frameCount.fetch_add(1);
 
-    // FIX: wait 8 frames before touching ImGui — surface must be stable
     if (frame < 8) return old_eglSwapBuffers(dpy, surface);
 
     if (!g_imguiSetup.load()) {
@@ -162,36 +156,32 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
 
     if (!g_eglReady.load()) return old_eglSwapBuffers(dpy, surface);
 
-    // Watchdog every frame
     ApplyWatchdog();
 
-    // ── ImGui Frame ────────────────────────────────────────────
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplAndroid_NewFrame();
     ImGui::NewFrame();
 
-    ImGui::SetNextWindowSize(ImVec2(370, 460), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(370, 480), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(10, 10),    ImGuiCond_FirstUseEver);
     ImGui::Begin(OBFUSCATE("THROWIO MOD - AXIOM"), nullptr,
                  ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize);
 
-    // Header
     ImGui::TextColored(ImVec4(0.0f, 0.8f, 1.0f, 1.0f), OBFUSCATE("  AXIOM DEVELOPMENT"));
     ImGui::Separator();
     ImGui::Spacing();
 
-    // Status badge
     bool connected = (g_BalanceInstance != nullptr);
     ImGui::TextColored(
         connected ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f) : ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
         connected ? OBFUSCATE("  [OK] Connected")
-                  : OBFUSCATE("  [..] Waiting — enter gameplay")
+                  : OBFUSCATE("  [..] Waiting — vao man choi")
     );
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
 
-    // ── CURRENCY ───────────────────────────────────────────────
+    // ── TIEN TE ────────────────────────────────────────────────
     ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.0f, 1.0f), OBFUSCATE(" TIEN TE"));
     ImGui::Spacing();
     ImGui::Checkbox(OBFUSCATE("Tien Mem Vo Han"),       &SWITCH::InfiniteMoney);
@@ -209,7 +199,7 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     ImGui::Separator();
     ImGui::Spacing();
 
-    // ── PROGRESSION ────────────────────────────────────────────
+    // ── TIEN TRINH ─────────────────────────────────────────────
     ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.0f, 1.0f), OBFUSCATE(" TIEN TRINH"));
     ImGui::Spacing();
     ImGui::Checkbox(OBFUSCATE("Max Level 99"), &SWITCH::MaxLevel);
@@ -225,7 +215,7 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     ImGui::Separator();
     ImGui::Spacing();
 
-    // ── COMBAT ─────────────────────────────────────────────────
+    // ── CHIEN DAU ──────────────────────────────────────────────
     ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.0f, 1.0f), OBFUSCATE(" CHIEN DAU"));
     ImGui::Spacing();
     ImGui::Checkbox(OBFUSCATE("God Mode (Bat Tu)"), &SWITCH::GodMode);
@@ -239,17 +229,18 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     ImGui::Separator();
     ImGui::Spacing();
 
-    // ── SECURITY ───────────────────────────────────────────────
+    // ── BAO MAT ────────────────────────────────────────────────
     ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.0f, 1.0f), OBFUSCATE(" BAO MAT"));
     ImGui::Spacing();
     ImGui::Checkbox(OBFUSCATE("Bypass Anti-Cheat"), &SWITCH::AntiCheat);
 
     ImGui::Spacing();
     ImGui::Separator();
+    ImGui::Spacing();
 
-    // FIX: show frame count for debug visibility
+    // ── DEBUG ──────────────────────────────────────────────────
     ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1.0f),
-                       OBFUSCATE("frame: %d"), frame);
+                       OBFUSCATE("frame: %d | log: /sdcard/ThrowIO_Crash/"), frame);
 
     ImGui::End();
     ImGui::Render();
@@ -345,16 +336,17 @@ void *hack_thread(void *) {
 
 // ================================================================
 //  ENTRY POINT
-//  FIX: null-check eglhandle + eglSwapBuffers before DHK
-//       retry loop if EGL not yet loaded at constructor time
 // ================================================================
 __attribute__((constructor))
 void lib_main() {
-    // FIX: retry dlopen — EGL may not be mapped yet at constructor time
+    // ── CRASH LOGGER — PHẢI LÀ DÒNG ĐẦU TIÊN ─────────────────
+    InitCrashLogger();
+
+    // ── EGL hook ───────────────────────────────────────────────
     void* eglhandle = nullptr;
     for (int retry = 0; retry < 20 && !eglhandle; retry++) {
         eglhandle = dlopen(OBFUSCATE("libEGL.so"), RTLD_NOW | RTLD_GLOBAL);
-        if (!eglhandle) usleep(50000); // 50ms between retries
+        if (!eglhandle) usleep(50000);
     }
 
     if (!eglhandle) {
@@ -364,7 +356,7 @@ void lib_main() {
 
     auto eglSwapBuffersSym = dlsym(eglhandle, OBFUSCATE("eglSwapBuffers"));
     if (!eglSwapBuffersSym) {
-        LOGE(OBFUSCATE("ThrowIO: FATAL — eglSwapBuffers symbol not resolved"));
+        LOGE(OBFUSCATE("ThrowIO: FATAL — eglSwapBuffers not resolved"));
         return;
     }
 
