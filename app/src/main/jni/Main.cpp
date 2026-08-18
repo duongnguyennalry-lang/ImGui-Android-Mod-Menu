@@ -1,35 +1,25 @@
-// ← THÊM 2 DÒNG NÀY — phải đứng TRƯỚC #include "MainHeader.h"
+// ================================================================
+//  THROWIO MOD - AXIOM DEVELOPMENT
+//  CRASH FIX v2 — SIGSEGV 0x0 @ offset 0x83cc0
+//
+//  ROOT CAUSE (từ log mới nhất):
+//    - il2cpp domain ready @ 0ms → domain ptr valid NHƯNG
+//      domain->assemblies list chưa populated
+//    - BNM AttachIl2Cpp() deref assemblies → null → SIGSEGV 0x0
+//    - offset 0x83cc0 = BNM init code trong libDuongdev.so
+//
+//  FIXES v2:
+//    [9]  usleep(2000ms) SAU domain ready — chờ assemblies populate
+//    [10] BNM attach probe loop tăng delay per attempt
+//    [11] GLES3 header force-include trước MainHeader.h
+// ================================================================
+
+// [FIX 11] Force GLES3 TRƯỚC MainHeader.h — GL_MAJOR_VERSION fix
 #include <GLES3/gl3.h>
 #include <GLES3/gl3ext.h>
 
 #include "MainHeader.h"
 #include "CrashLogger.h"
-
-// ================================================================
-//  THROWIO MOD - AXIOM DEVELOPMENT
-// ... phần còn lại giữ nguyên y chang
-
-// ================================================================
-//  THROWIO MOD - AXIOM DEVELOPMENT
-//  VERSION: CRASH FIX — deterministic SIGSEGV 0x86694
-//
-//  ROOT CAUSE (đã xác định từ log):
-//    - fault addr 0xec1e36c9a0 GIỐNG NHAU cả 2 crash = bad fn pointer
-//    - call chain: libunity → libDuongdev offset 0x86694
-//    - = hook_eglSwapBuffers gọi SetupImGui() / ImGui GL backend
-//      khi GL function pointers chưa được load → gọi null/garbage ptr
-//    - frame warmup 30 KHÔNG ĐỦ cho Unity khởi tạo GL state
-//
-//  FIXES APPLIED:
-//    [1] Warmup tăng 30 → 90 frames
-//    [2] Guard EGL_NO_SURFACE trước eglQuerySurface
-//    [3] Check eglQuerySurface return value
-//    [4] GL smoke test (glGetIntegerv) trước khi cho phép ImGui init
-//    [5] ImGui context null check trước NewFrame
-//    [6] IsValidPtr — fix mincore() size alignment
-//    [7] hack_thread — poll il2cpp domain ready trước AttachIl2Cpp
-//    [8] Tăng initial delay 500ms → 1500ms cho il2cpp metadata warm
-// ================================================================
 
 // ================================================================
 //  FUNCTION POINTERS
@@ -73,21 +63,18 @@ static std::atomic<bool> g_eglReady{false};
 static std::atomic<bool> g_imguiSetup{false};
 static std::atomic<bool> g_hooksReady{false};
 static std::atomic<bool> g_imguiFailed{false};
-static std::atomic<int>  g_failCount{0};   // [FIX 1] track consecutive failures
+static std::atomic<int>  g_failCount{0};
 
-static EGLDisplay        g_savedDisplay = EGL_NO_DISPLAY;
-static EGLContext        g_savedContext = EGL_NO_CONTEXT;
+static EGLDisplay g_savedDisplay = EGL_NO_DISPLAY;
+static EGLContext g_savedContext = EGL_NO_CONTEXT;
 
 EGLBoolean (*old_eglSwapBuffers)(EGLDisplay, EGLSurface) = nullptr;
 
 // ================================================================
-//  [FIX 6] IsValidPtr — mincore cần page-aligned length
-//  Bug cũ: mincore(page, 1, &vec) — sz=1 không aligned
-//  Một số kernel check strict alignment → undefined behavior
+//  IsValidPtr
 // ================================================================
 static bool IsValidPtr(const void* ptr, size_t sz = sizeof(void*)) {
     if (!ptr) return false;
-    // Không deref address quá cao — arm64 user space max ~0x7fffffffffff
     if (reinterpret_cast<uintptr_t>(ptr) > 0x7fffffffffffULL) return false;
 
     long pageSize = sysconf(_SC_PAGESIZE);
@@ -96,7 +83,6 @@ static bool IsValidPtr(const void* ptr, size_t sz = sizeof(void*)) {
     uintptr_t page = reinterpret_cast<uintptr_t>(ptr)
                      & ~static_cast<uintptr_t>(pageSize - 1);
 
-    // [FIX 6] mincore length phải là bội số của pageSize
     size_t alignedSz = (sz + static_cast<size_t>(pageSize) - 1)
                        & ~static_cast<size_t>(pageSize - 1);
     if (alignedSz == 0) alignedSz = static_cast<size_t>(pageSize);
@@ -121,16 +107,11 @@ static bool IsEGLContextCurrent() {
 }
 
 // ================================================================
-//  [FIX 4] GL Smoke Test — kiểm tra GL thực sự hoạt động
-//  Đây là nguyên nhân crash offset 0x86694:
-//  ImGui OpenGL3 backend gọi glGetIntegerv / glGenTextures ngay khi init
-//  Nếu GL function pointers chưa load → crash tại bad fn pointer
+//  IsGLReady
 // ================================================================
 static bool IsGLReady() {
-    // Flush error state trước
     while (glGetError() != GL_NO_ERROR) {}
 
-    // Probe: đọc GL_MAJOR_VERSION — nếu GL chưa ready sẽ trả về error
     GLint major = 0;
     glGetIntegerv(GL_MAJOR_VERSION, &major);
 
@@ -144,7 +125,6 @@ static bool IsGLReady() {
         return false;
     }
 
-    // Probe 2: viewport phải có kích thước hợp lệ
     GLint viewport[4] = {0};
     glGetIntegerv(GL_VIEWPORT, viewport);
     if (glGetError() != GL_NO_ERROR || viewport[2] <= 0 || viewport[3] <= 0) {
@@ -152,7 +132,6 @@ static bool IsGLReady() {
              viewport[0], viewport[1], viewport[2], viewport[3]);
         return false;
     }
-
     return true;
 }
 
@@ -170,7 +149,7 @@ static inline void ApplyWatchdog() {
 }
 
 // ================================================================
-//  HOOK: Capture g_BalanceInstance
+//  HOOKs
 // ================================================================
 void capture_set_SoftMoney(void* instance, long value) {
     if (instance && IsValidPtr(instance) && !g_BalanceInstance) {
@@ -180,33 +159,21 @@ void capture_set_SoftMoney(void* instance, long value) {
     if (orig_set_SoftMoney) orig_set_SoftMoney(instance, value);
 }
 
-// ================================================================
-//  HOOK: ApplyDamage — GodMode
-// ================================================================
 void hook_ApplyDamage(void* instance, long damage, void* from, bool isCritical, void* extra) {
     if (SWITCH::GodMode && instance) return;
     if (old_ApplyDamage) old_ApplyDamage(instance, damage, from, isCritical, extra);
 }
 
-// ================================================================
-//  HOOK: SetDeath — GodMode
-// ================================================================
 void hook_SetDeath(void* instance, bool isDead) {
     if (SWITCH::GodMode && instance) isDead = false;
     if (old_SetDeath) old_SetDeath(instance, isDead);
 }
 
-// ================================================================
-//  HOOK: CharWeapon::update — SpeedHack
-// ================================================================
 void hook_CharWeapon_update(void* instance, float deltaTime) {
     if (SWITCH::SpeedHack && instance) deltaTime *= speedMultiplier;
     if (old_CharWeapon_update) old_CharWeapon_update(instance, deltaTime);
 }
 
-// ================================================================
-//  HOOK: SaveLocal — Anti-Cheat
-// ================================================================
 void hook_SaveLocal(void* instance) {
     if (SWITCH::AntiCheat) ApplyWatchdog();
     if (old_SaveLocal) old_SaveLocal(instance);
@@ -240,15 +207,13 @@ static void ApplyImGuiStyle() {
 }
 
 // ================================================================
-//  SafeSetupImGui — với GL smoke test
+//  SafeSetupImGui
 // ================================================================
 static bool SafeSetupImGui(EGLDisplay dpy, EGLSurface surface) {
     if (!IsEGLContextCurrent()) {
         LOGE(OBFUSCATE("ThrowIO: SafeSetupImGui — no valid EGL context"));
         return false;
     }
-
-    // [FIX 4] GL phải ready trước khi ImGui OpenGL3 backend init
     if (!IsGLReady()) {
         LOGE(OBFUSCATE("ThrowIO: SafeSetupImGui — GL not ready, skip"));
         return false;
@@ -261,10 +226,9 @@ static bool SafeSetupImGui(EGLDisplay dpy, EGLSurface surface) {
 
     SetupImGui();
 
-    // [FIX 5] Verify ImGui context tồn tại sau SetupImGui
     ImGuiContext* imCtx = ImGui::GetCurrentContext();
     if (!imCtx) {
-        LOGE(OBFUSCATE("ThrowIO: SetupImGui returned null context — sẽ retry"));
+        LOGE(OBFUSCATE("ThrowIO: SetupImGui returned null context — retry"));
         return false;
     }
 
@@ -281,22 +245,17 @@ static bool SafeSetupImGui(EGLDisplay dpy, EGLSurface surface) {
 }
 
 // ================================================================
-//  HOOK: eglSwapBuffers — crash-resistant version
+//  HOOK: eglSwapBuffers
 // ================================================================
 EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
-    // Guard: original function phải tồn tại
     if (!old_eglSwapBuffers) return EGL_FALSE;
 
-    // [FIX 2] Guard: EGL_NO_SURFACE crash — một số Unity version gọi
-    // eglSwapBuffers với surface null trong quá trình khởi tạo
     if (dpy == EGL_NO_DISPLAY || surface == EGL_NO_SURFACE)
         return old_eglSwapBuffers(dpy, surface);
 
-    // Guard: context phải có trên thread này
     if (eglGetCurrentContext() == EGL_NO_CONTEXT)
         return old_eglSwapBuffers(dpy, surface);
 
-    // [FIX 3] Check return value của eglQuerySurface
     EGLint w = 0, h = 0;
     if (eglQuerySurface(dpy, surface, EGL_WIDTH,  &w) != EGL_TRUE ||
         eglQuerySurface(dpy, surface, EGL_HEIGHT, &h) != EGL_TRUE) {
@@ -311,15 +270,10 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
 
     int frame = g_frameCount.fetch_add(1, std::memory_order_relaxed);
 
-    // [FIX 1] Tăng warmup 30 → 90 frames
-    // 30 frame KHÔNG ĐỦ cho Unity GL state init hoàn toàn
-    // fault addr 0xec1e36c9a0 = ImGui gọi GL fn pointer chưa load
     if (frame < 90) return old_eglSwapBuffers(dpy, surface);
 
-    // Retry logic — backoff tăng dần nếu fail nhiều lần
     if (g_imguiFailed.load(std::memory_order_acquire)) {
         int fails = g_failCount.load(std::memory_order_relaxed);
-        // Backoff: fail ít → retry sau 60 frame, fail nhiều → 180 frame
         int retryInterval = (fails < 3) ? 60 : (fails < 6) ? 120 : 180;
         if (frame % retryInterval != 0) return old_eglSwapBuffers(dpy, surface);
 
@@ -332,7 +286,7 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     if (!g_imguiSetup.load(std::memory_order_acquire)) {
         bool ok = SafeSetupImGui(dpy, surface);
         if (ok) {
-            g_failCount.store(0, std::memory_order_relaxed); // reset fail counter
+            g_failCount.store(0, std::memory_order_relaxed);
             g_imguiSetup.store(true, std::memory_order_release);
             g_eglReady.store(true,   std::memory_order_release);
         } else {
@@ -354,7 +308,6 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
         return old_eglSwapBuffers(dpy, surface);
     }
 
-    // [FIX 5] ImGui context null check trước MỌI ImGui call
     ImGuiContext* imCtx = ImGui::GetCurrentContext();
     if (!imCtx) {
         LOGE(OBFUSCATE("ThrowIO: ImGui context null — reset"));
@@ -498,19 +451,13 @@ JNI_OnLoad(JavaVM* vm, void* reserved) {
 }
 
 // ================================================================
-//  [FIX 7] Il2Cpp domain readiness poll
-//  AttachIl2Cpp() đọc domain->assemblies khi init
-//  Nếu domain chưa populated → đọc garbage → crash
+//  [FIX 7] WaitForIl2CppDomainReady
 // ================================================================
 static bool WaitForIl2CppDomainReady(uintptr_t baseAddr, int maxWaitMs = 5000) {
-    // il2cpp_domain_get là export tiêu chuẩn
-    // Tìm trong lib đã load, poll cho đến khi trả về non-null
     typedef void* (*domain_get_fn)();
     void* libHandle = dlopen(OBFUSCATE("libil2cpp.so"), RTLD_NOW | RTLD_NOLOAD);
     if (!libHandle) {
-        // il2cpp có thể embedded trong libunity hoặc game lib
-        // fallback: chỉ sleep và hy vọng
-        LOGI(OBFUSCATE("ThrowIO: libil2cpp standalone not found, using timed wait"));
+        LOGI(OBFUSCATE("ThrowIO: libil2cpp standalone not found, timed wait"));
         usleep(static_cast<useconds_t>(maxWaitMs) * 1000);
         return true;
     }
@@ -525,11 +472,11 @@ static bool WaitForIl2CppDomainReady(uintptr_t baseAddr, int maxWaitMs = 5000) {
     }
 
     int elapsed = 0;
-    const int step = 100; // 100ms per check
+    const int step = 100;
     while (elapsed < maxWaitMs) {
         void* domain = domain_get();
         if (domain && IsValidPtr(domain)) {
-            LOGI(OBFUSCATE("ThrowIO: il2cpp domain ready @ %p (waited %dms)"),
+            LOGI(OBFUSCATE("ThrowIO: il2cpp domain ptr ready @ %p (waited %dms)"),
                  domain, elapsed);
             dlclose(libHandle);
             return true;
@@ -540,7 +487,7 @@ static bool WaitForIl2CppDomainReady(uintptr_t baseAddr, int maxWaitMs = 5000) {
 
     LOGE(OBFUSCATE("ThrowIO: il2cpp domain NOT ready after %dms"), maxWaitMs);
     dlclose(libHandle);
-    return false; // caller decide whether to proceed anyway
+    return false;
 }
 
 // ================================================================
@@ -552,35 +499,45 @@ void* hack_thread(void*) {
     LOGI(OBFUSCATE("ThrowIO: il2cpp detected @ %p"),
          reinterpret_cast<void*>(address));
 
-    // [FIX 8] Tăng initial delay 500ms → 1500ms
-    // 500ms không đủ cho il2cpp metadata init trên thiết bị chậm
+    // [FIX 8] 1500ms initial delay
     usleep(1500000);
 
-    // [FIX 7] Poll il2cpp domain trước khi attach
-    // Không bắt buộc thành công — proceed dù sao với backoff
+    // [FIX 7] Poll domain ptr
     WaitForIl2CppDomainReady(address, 3000);
+
+    // [FIX 9] CRITICAL — domain ptr valid != assemblies populated
+    // log trước đây: "domain ready (waited 0ms)" → crash ngay sau
+    // domain ptr = shell rỗng, BNM đọc assemblies list → null ptr → SIGSEGV 0x0
+    // 2000ms buffer đủ cho Unity populate assembly list sau khi domain init
+    LOGI(OBFUSCATE("ThrowIO: domain ptr valid — waiting 2s for assemblies populate..."));
+    usleep(2000000);
+    LOGI(OBFUSCATE("ThrowIO: assemblies buffer done — proceeding to BNM attach"));
 
     bool attached = false;
     for (int attempt = 0; attempt < 15 && !attached; attempt++) {
-        // Tăng từ 10 → 15 attempts
         std::atomic_thread_fence(std::memory_order_seq_cst);
 
+        LOGI(OBFUSCATE("ThrowIO: BNM attach attempt %d..."), attempt);
         AttachIl2Cpp();
 
         auto probe = getClass(OBFUSCATE("PlayerBalance"), OBFUSCATE("ThrowIO"));
         if (probe) {
             attached = true;
-            LOGI(OBFUSCATE("ThrowIO: BNM attached — attempt %d"), attempt);
+            LOGI(OBFUSCATE("ThrowIO: BNM attached OK — attempt %d"), attempt);
         } else {
-            LOGE(OBFUSCATE("ThrowIO: attach attempt %d failed"), attempt);
+            LOGE(OBFUSCATE("ThrowIO: attach attempt %d failed — DetachIl2Cpp"), attempt);
             DetachIl2Cpp();
-            // Backoff tăng dần: lần đầu 300ms, sau đó 500ms
-            usleep(attempt < 5 ? 300000 : 500000);
+            // [FIX 10] Backoff tăng dần per attempt
+            int delayUs = attempt < 3  ? 500000  :   // 0.5s
+                          attempt < 7  ? 1000000 :   // 1.0s
+                                         2000000;    // 2.0s
+            LOGI(OBFUSCATE("ThrowIO: retry in %dms"), delayUs / 1000);
+            usleep(delayUs);
         }
     }
 
     if (!attached) {
-        LOGE(OBFUSCATE("ThrowIO: FATAL — BNM attach failed after 15 attempts"));
+        LOGE(OBFUSCATE("ThrowIO: FATAL — BNM attach failed after 15 attempts, abort"));
         return nullptr;
     }
 
@@ -594,17 +551,18 @@ void* hack_thread(void*) {
     BNM::LoadClass playerDataClass = getClass(OBFUSCATE("PlayerData"),    OBFUSCATE("ThrowIO"));
     BNM::LoadClass charWeaponClass = getClass(OBFUSCATE("CharWeapon"),    OBFUSCATE("ThrowIO"));
 
-    LOGI(OBFUSCATE("Classes: balance=%d char=%d pdata=%d cweapon=%d"),
+    LOGI(OBFUSCATE("ThrowIO: classes — balance=%d char=%d pdata=%d cweapon=%d"),
          (bool)balanceClass, (bool)charClass,
          (bool)playerDataClass, (bool)charWeaponClass);
 
     auto safe_offset = [](BNM::LoadClass cls, const char* name) -> uintptr_t {
         if (!cls) {
-            LOGE(OBFUSCATE("ThrowIO: null class cho [%s]"), name);
+            LOGE(OBFUSCATE("ThrowIO: null class for [%s]"), name);
             return 0;
         }
         uintptr_t off = getOffset(cls, name, 0);
-        if (!off) LOGE(OBFUSCATE("ThrowIO: offset 0 cho [%s]"), name);
+        if (!off) LOGE(OBFUSCATE("ThrowIO: offset=0 for [%s]"), name);
+        else      LOGI(OBFUSCATE("ThrowIO: [%s] = 0x%lx"), name, (unsigned long)off);
         return off;
     };
 
@@ -620,16 +578,6 @@ void* hack_thread(void*) {
     auto off_setDeath     = safe_offset(charClass,       OBFUSCATE("SetDeath"));
     auto off_cwUpdate     = safe_offset(charWeaponClass, OBFUSCATE("update"));
     auto off_saveLocal    = safe_offset(playerDataClass, OBFUSCATE("SaveLocal"));
-
-    LOGI(OBFUSCATE("Offsets: SM=%p HM=%p LV=%p EX=%p AD=%p SD=%p CW=%p SL=%p"),
-         reinterpret_cast<void*>(off_setSoftMoney),
-         reinterpret_cast<void*>(off_setHardMoney),
-         reinterpret_cast<void*>(off_setLevel),
-         reinterpret_cast<void*>(off_setExp),
-         reinterpret_cast<void*>(off_applyDamage),
-         reinterpret_cast<void*>(off_setDeath),
-         reinterpret_cast<void*>(off_cwUpdate),
-         reinterpret_cast<void*>(off_saveLocal));
 
     if (off_setSoftMoney) AddPointer(set_SoftMoney, off_setSoftMoney);
     if (off_setHardMoney) AddPointer(set_HardMoney, off_setHardMoney);
