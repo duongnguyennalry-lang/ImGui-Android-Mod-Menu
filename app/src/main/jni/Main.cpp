@@ -1,6 +1,6 @@
 // ================================================================
 //  THROWIO MOD - AXIOM DEVELOPMENT
-//  FULL FIXED MAIN.CPP — BNM METHOD POINTER FIX (NO TRUNCATION)
+//  FULL FIXED MAIN.CPP — BNM GetMethod FIX
 // ================================================================
 
 #include <GLES3/gl3.h>
@@ -414,7 +414,7 @@ JNI_OnLoad(JavaVM* vm, void* reserved) {
 }
 
 // ================================================================
-//  HACK THREAD (BNM METHOD POINTER RETRIEVAL & DOBBY HOOKING)
+//  HACK THREAD (BNM GetMethod & DOBBY HOOKING)
 // ================================================================
 void* hack_thread(void*) {
     do { sleep(1); } while (!isLibraryLoaded(targetLibName));
@@ -444,10 +444,10 @@ void* hack_thread(void*) {
     BNM::LoadClass playerDataClass = getClass(OBFUSCATE("PlayerData"),    OBFUSCATE("ThrowIO"));
     BNM::LoadClass charWeaponClass = getClass(OBFUSCATE("CharWeapon"),    OBFUSCATE("ThrowIO"));
 
-    // Lambda an toàn để lấy con trỏ hàm thông qua getMethod().getPointer()
+    // Sử dụng GetMethod thay vì getMethod để đúng chuẩn của BNM
     auto safe_method_ptr = [](BNM::LoadClass cls, const char* name, int args = -1) -> void* {
         if (!cls) return nullptr;
-        auto m = cls.getMethod(name, args);
+        auto m = cls.GetMethod(name, args);
         if (!m) {
             LOGE(OBFUSCATE("ThrowIO: Khong tim thay method [%s]"), name);
             return nullptr;
