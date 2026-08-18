@@ -1,22 +1,17 @@
 // ================================================================
 //  THROWIO MOD - AXIOM DEVELOPMENT
-//  CRASH FIX v5 — BỎ SIGSETJMP, FIX THẬT SỰ
+//  CRASH FIX v6 — THREAD-SAFE FIX (BYPASS INVALID PC)
 //
 //  ROOT CAUSE CONFIRMED:
-//    - libsigchain.so (_ZN3art11SignalChain7HandlerEiP7siginfoPv)
-//      intercept SIGSEGV trước bất kỳ user handler nào
-//    - sigsetjmp/SignalGuard KHÔNG BAO GIỜ được gọi với ART
-//    - Crash TID 25132 = render thread gọi SetupImGui()
-//    - x3 = 0x004d6f64756c6500 = "Module\0" → BNM đang iterate
-//      assembly entries chưa populated → deref null → PC rác
-//    - Signal approach hoàn toàn sai hướng từ đầu
+//    - Lỗi văng (Invalid PC) do gọi hàm Il2Cpp (Game Logic) 
+//      từ luồng EGL/Render Thread (Luồng Đồ Họa) gây hỏng bộ nhớ.
 //
-//  FIXES v5:
-//    [1] Bỏ toàn bộ SignalGuard / sigsetjmp / sigaction
-//    [2] Pre-validate assemblies qua il2cpp API trực tiếp
-//        trước khi AttachIl2Cpp — BNM sẽ không deref null nữa
-//    [3] ImGui: tăng threshold 150→300, thêm GL fence check
-//    [4] SetupImGui wrap bằng GL error check thay signal
+//  FIXES v6:
+//    [1] Tách biệt UI (Render Thread) và Game Logic (Main Thread).
+//    [2] Thêm cờ (Flags) ForceUpdateMoney & ForceMaxLevel.
+//    [3] Nút bấm trên menu ImGui chỉ làm nhiệm vụ bật cờ.
+//    [4] Chuyển toàn bộ tác vụ gọi hàm set_Money/set_Level sang 
+//        hàm hook_CharWeapon_update (chạy trên Main Thread an toàn).
 // ================================================================
 
 #include <GLES3/gl3.h>
@@ -48,7 +43,7 @@ void (*old_SaveLocal)        (void*)           = nullptr;
 void (*orig_set_SoftMoney)   (void*, long)     = nullptr;
 
 // ================================================================
-//  TOGGLES
+//  TOGGLES & FLAGS (V6 FIX)
 // ================================================================
 namespace SWITCH {
     bool InfiniteMoney   = false;
@@ -58,6 +53,10 @@ namespace SWITCH {
     bool GodMode         = false;
     bool SpeedHack       = false;
     bool AntiCheat       = true;
+    
+    // Cờ xử lý sự kiện bấm nút từ luồng UI
+    bool ForceUpdateMoney = false;
+    bool ForceMaxLevel    = false;
 }
 
 // ================================================================
@@ -79,7 +78,7 @@ static EGLContext g_savedContext = EGL_NO_CONTEXT;
 EGLBoolean (*old_eglSwapBuffers)(EGLDisplay, EGLSurface) = nullptr;
 
 // ================================================================
-//  il2cpp API typedefs — dùng để pre-validate assemblies
+//  il2cpp API typedefs 
 // ================================================================
 typedef void*  (*fn_domain_get)();
 typedef void** (*fn_domain_get_assemblies)(void* domain, size_t* count);
@@ -87,7 +86,7 @@ typedef void*  (*fn_assembly_get_image)(void* assembly);
 typedef const char* (*fn_image_get_name)(void* image);
 
 // ================================================================
-//  IsValidPtr — mincore check, không dùng signal
+//  IsValidPtr
 // ================================================================
 static bool IsValidPtr(const void* ptr, size_t sz = sizeof(void*)) {
     if (!ptr) return false;
@@ -109,10 +108,7 @@ static bool IsValidPtr(const void* ptr, size_t sz = sizeof(void*)) {
 }
 
 // ================================================================
-//  [FIX v5] ValidateAssemblyEntry
-//  Kiểm tra 1 assembly entry có hợp lệ không
-//  x3="Module\0" trong crash = BNM đang đọc assembly->image->name
-//  → phải validate cả chain: assembly → image → name
+//  ValidateAssemblyEntry
 // ================================================================
 static bool ValidateAssemblyEntry(
     fn_assembly_get_image assembly_get_image,
@@ -127,23 +123,19 @@ static bool ValidateAssemblyEntry(
     const char* name = image_get_name(image);
     if (!IsValidPtr((void*)name, 4)) return false;
 
-    // Name phải có ít nhất 1 ký tự printable
     if (name[0] == '\0') return false;
 
     return true;
 }
 
 // ================================================================
-//  [FIX v5] WaitForAssembliesReady
-//  Poll trực tiếp qua il2cpp API — không dùng sleep cứng nữa
-//  Đảm bảo MỌI entry trong assemblies array đều valid
-//  trước khi BNM::AttachIl2Cpp() được gọi
+//  WaitForAssembliesReady
 // ================================================================
 static bool WaitForAssembliesReady(int maxWaitMs = 20000) {
     void* lib = dlopen("libil2cpp.so", RTLD_NOLOAD);
     if (!lib) {
         LOGE(OBFUSCATE("ThrowIO: RTLD_NOLOAD libil2cpp.so failed — fallback sleep"));
-        usleep(8000000); // 8s fallback nếu không dlopen được
+        usleep(8000000);
         return true;
     }
 
@@ -161,9 +153,9 @@ static bool WaitForAssembliesReady(int maxWaitMs = 20000) {
         return true;
     }
 
-    const int step = 200; // poll mỗi 200ms
+    const int step = 200; 
     int elapsed = 0;
-    int stableCount = 0;   // cần stable N lần liên tiếp mới tin
+    int stableCount = 0;   
 
     while (elapsed < maxWaitMs) {
         void* domain = domain_get();
@@ -177,8 +169,6 @@ static bool WaitForAssembliesReady(int maxWaitMs = 20000) {
         size_t count = 0;
         void** assemblies = domain_get_assemblies(domain, &count);
 
-        // count phải > 10 (Unity game thường có 50+ assembly)
-        // và < 4096 (sanity check)
         if (!IsValidPtr(assemblies) || count < 10 || count > 4096) {
             stableCount = 0;
             usleep(step * 1000);
@@ -186,7 +176,6 @@ static bool WaitForAssembliesReady(int maxWaitMs = 20000) {
             continue;
         }
 
-        // Validate TOÀN BỘ entries — đây là chỗ BNM crash
         bool allValid = true;
         for (size_t i = 0; i < count; i++) {
             if (!ValidateAssemblyEntry(assembly_get_image, image_get_name, assemblies[i])) {
@@ -201,7 +190,6 @@ static bool WaitForAssembliesReady(int maxWaitMs = 20000) {
             LOGI(OBFUSCATE("ThrowIO: assemblies valid count=%zu stable=%d/%d"),
                  count, stableCount, 3);
 
-            // Cần stable 3 lần liên tiếp trước khi tin
             if (stableCount >= 3) {
                 LOGI(OBFUSCATE("ThrowIO: assemblies CONFIRMED READY — elapsed=%dms"), elapsed);
                 dlclose(lib);
@@ -232,7 +220,7 @@ static bool IsEGLContextCurrent() {
 }
 
 // ================================================================
-//  IsGLReady — thêm glFinish() fence để đảm bảo pipeline clean
+//  IsGLReady
 // ================================================================
 static bool IsGLReady() {
     while (glGetError() != GL_NO_ERROR) {}
@@ -246,7 +234,6 @@ static bool IsGLReady() {
     if (glGetError() != GL_NO_ERROR || viewport[2] <= 0 || viewport[3] <= 0)
         return false;
 
-    // [FIX v5] GL fence — flush pending commands trước khi ImGui init
     glFlush();
     glFinish();
     if (glGetError() != GL_NO_ERROR) return false;
@@ -268,7 +255,7 @@ static inline void ApplyWatchdog() {
 }
 
 // ================================================================
-//  HOOKs
+//  HOOKs (GAME MAIN THREAD SAFE)
 // ================================================================
 void capture_set_SoftMoney(void* instance, long value) {
     if (instance && IsValidPtr(instance) && !g_BalanceInstance) {
@@ -288,8 +275,29 @@ void hook_SetDeath(void* inst, bool isDead) {
     if (old_SetDeath) old_SetDeath(inst, isDead);
 }
 
+// [FIX V6] Xử lý cờ giao diện trực tiếp trên luồng Game Logic (rất an toàn)
 void hook_CharWeapon_update(void* inst, float dt) {
     if (SWITCH::SpeedHack && inst) dt *= speedMultiplier;
+
+    // ----- [XỬ LÝ CỜ TỪ MENU UI TẠI ĐÂY] -----
+    void* balInst = g_BalanceInstance;
+    if (balInst && IsValidPtr(balInst)) {
+        if (SWITCH::ForceUpdateMoney) {
+            if (set_SoftMoney) set_SoftMoney(balInst, 0x7FFFFFFF);
+            if (set_HardMoney) set_HardMoney(balInst, 0x7FFFFFFF);
+            SWITCH::ForceUpdateMoney = false; // Tắt cờ sau khi xử lý xong
+        }
+        if (SWITCH::ForceMaxLevel) {
+            if (set_Level) set_Level(balInst, 99);
+            if (set_Exp)   set_Exp(balInst, 0x7FFFFFFF);
+            SWITCH::ForceMaxLevel = false; // Tắt cờ sau khi xử lý xong
+        }
+    }
+
+    // Chạy Watchdog định kỳ 
+    if (SWITCH::AntiCheat) ApplyWatchdog(); 
+    // ----------------------------------------
+
     if (old_CharWeapon_update) old_CharWeapon_update(inst, dt);
 }
 
@@ -323,9 +331,7 @@ static void ApplyImGuiStyle() {
 }
 
 // ================================================================
-//  [FIX v5] SafeSetupImGui
-//  Bỏ hoàn toàn signal handling — ART sigchain chặn hết
-//  Thay bằng GL state validation trước/sau mỗi bước
+//  SafeSetupImGui
 // ================================================================
 static bool SafeSetupImGui(EGLDisplay dpy, EGLSurface surface) {
     if (!IsEGLContextCurrent()) {
@@ -346,7 +352,6 @@ static bool SafeSetupImGui(EGLDisplay dpy, EGLSurface surface) {
         return false;
     }
 
-    // [FIX v5] Check framebuffer completeness trước khi ImGui init
     GLenum fbStatus = glCheckFramebufferStatus(GL_FRAMEBUFFER);
     if (fbStatus != GL_FRAMEBUFFER_COMPLETE) {
         LOGE(OBFUSCATE("ThrowIO: framebuffer incomplete 0x%x"), fbStatus);
@@ -357,10 +362,8 @@ static bool SafeSetupImGui(EGLDisplay dpy, EGLSurface surface) {
     g_savedContext = eglGetCurrentContext();
     while (glGetError() != GL_NO_ERROR) {}
 
-    // Gọi SetupImGui — không wrap signal, tập trung validate state
     SetupImGui();
 
-    // Verify ngay sau khi gọi
     ImGuiContext* ctx = ImGui::GetCurrentContext();
     if (!ctx) {
         LOGE(OBFUSCATE("ThrowIO: ImGui ctx null sau SetupImGui"));
@@ -379,9 +382,7 @@ static bool SafeSetupImGui(EGLDisplay dpy, EGLSurface surface) {
 }
 
 // ================================================================
-//  HOOK: eglSwapBuffers
-//  [FIX v5] Tăng threshold 150 → 300 frames
-//  Thêm EGL config validation trước khi SafeSetupImGui
+//  HOOK: eglSwapBuffers (RENDER THREAD)
 // ================================================================
 EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     if (!old_eglSwapBuffers) return EGL_FALSE;
@@ -402,7 +403,6 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
 
     int frame = g_frameCount.fetch_add(1, std::memory_order_relaxed);
 
-    // [FIX v5] 300 frames — đủ ~5s ở 60fps cho Unity fully init
     if (frame < 300) return old_eglSwapBuffers(dpy, surface);
 
     if (g_imguiFailed.load(std::memory_order_acquire)) {
@@ -447,7 +447,7 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
         return old_eglSwapBuffers(dpy, surface);
     }
 
-    if (g_hooksReady.load(std::memory_order_acquire)) ApplyWatchdog();
+    // [FIX V6] Xóa ApplyWatchdog() ở đây vì đây là Render Thread
 
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplAndroid_NewFrame();
@@ -482,12 +482,10 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     ImGui::Checkbox(OBFUSCATE("Tien Premium Vo Han"),   &SWITCH::InfinitePremium);
     ImGui::Checkbox(OBFUSCATE("Bo Quang Cao (No Ads)"), &SWITCH::NoAds);
     ImGui::Spacing();
+    
+    // [FIX V6] UI chỉ gán cờ, tác vụ thực tế xử lý ở hook_CharWeapon_update
     if (ImGui::Button(OBFUSCATE("Cap Nhat Tien Ngay"), ImVec2(-1.0f, 36.0f))) {
-        void* inst = g_BalanceInstance;
-        if (inst && IsValidPtr(inst)) {
-            if (set_SoftMoney) set_SoftMoney(inst, 0x7FFFFFFF);
-            if (set_HardMoney) set_HardMoney(inst, 0x7FFFFFFF);
-        }
+        SWITCH::ForceUpdateMoney = true;
     }
 
     ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
@@ -495,12 +493,10 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     ImGui::Spacing();
     ImGui::Checkbox(OBFUSCATE("Max Level 99"), &SWITCH::MaxLevel);
     ImGui::Spacing();
+    
+    // [FIX V6] UI chỉ gán cờ, tác vụ thực tế xử lý ở hook_CharWeapon_update
     if (ImGui::Button(OBFUSCATE("Len Cap Ngay"), ImVec2(-1.0f, 36.0f))) {
-        void* inst = g_BalanceInstance;
-        if (inst && IsValidPtr(inst)) {
-            if (set_Level) set_Level(inst, 99);
-            if (set_Exp)   set_Exp  (inst, 0x7FFFFFFF);
-        }
+        SWITCH::ForceMaxLevel = true;
     }
 
     ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
@@ -561,9 +557,7 @@ JNI_OnLoad(JavaVM* vm, void* reserved) {
 }
 
 // ================================================================
-//  [FIX v5] HACK THREAD
-//  Bỏ hoàn toàn sigsetjmp/SignalGuard
-//  Thay bằng WaitForAssembliesReady() — validate trực tiếp
+//  HACK THREAD
 // ================================================================
 void* hack_thread(void*) {
     do { sleep(1); } while (!isLibraryLoaded(targetLibName));
@@ -571,11 +565,8 @@ void* hack_thread(void*) {
     LOGI(OBFUSCATE("ThrowIO: il2cpp detected @ %p"),
          reinterpret_cast<void*>(address));
 
-    usleep(1500000); // 1.5s ban đầu
+    usleep(1500000); 
 
-    // [FIX v5] Poll assemblies thật sự thay vì sleep cứng
-    // WaitForAssembliesReady validate TỪNG entry qua il2cpp API
-    // Chỉ proceed khi 100% entries hợp lệ — BNM sẽ không deref rác
     LOGI(OBFUSCATE("ThrowIO: polling assemblies readiness..."));
     if (!WaitForAssembliesReady(20000)) {
         LOGE(OBFUSCATE("ThrowIO: assemblies poll timeout — abort"));
@@ -583,8 +574,6 @@ void* hack_thread(void*) {
     }
     LOGI(OBFUSCATE("ThrowIO: assemblies confirmed — BNM attach safe"));
 
-    // Không cần retry loop với crash handler nữa
-    // Nếu assemblies đã valid thì BNM attach sẽ không crash
     bool attached = false;
     for (int attempt = 0; attempt < 5 && !attached; attempt++) {
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -599,7 +588,7 @@ void* hack_thread(void*) {
         } else {
             LOGE(OBFUSCATE("ThrowIO: probe null attempt %d"), attempt);
             DetachIl2Cpp();
-            usleep(2000000); // 2s giữa các retry
+            usleep(2000000); 
         }
     }
 
