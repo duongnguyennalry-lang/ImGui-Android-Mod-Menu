@@ -245,7 +245,6 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
         ApplyWatchdog();
     }
 
-    // ── ImGui Frame ────────────────────────────────────────────
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplAndroid_NewFrame();
     ImGui::NewFrame();
@@ -280,7 +279,6 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     ImGui::Separator();
     ImGui::Spacing();
 
-    // ── TIEN TE ────────────────────────────────────────────────
     ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.0f, 1.0f), OBFUSCATE(" TIEN TE"));
     ImGui::Spacing();
     ImGui::Checkbox(OBFUSCATE("Tien Mem Vo Han"),       &SWITCH::InfiniteMoney);
@@ -299,7 +297,6 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     ImGui::Separator();
     ImGui::Spacing();
 
-    // ── TIEN TRINH ─────────────────────────────────────────────
     ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.0f, 1.0f), OBFUSCATE(" TIEN TRINH"));
     ImGui::Spacing();
     ImGui::Checkbox(OBFUSCATE("Max Level 99"), &SWITCH::MaxLevel);
@@ -316,7 +313,6 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     ImGui::Separator();
     ImGui::Spacing();
 
-    // ── CHIEN DAU ──────────────────────────────────────────────
     ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.0f, 1.0f), OBFUSCATE(" CHIEN DAU"));
     ImGui::Spacing();
     ImGui::Checkbox(OBFUSCATE("God Mode (Bat Tu)"), &SWITCH::GodMode);
@@ -330,7 +326,6 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     ImGui::Separator();
     ImGui::Spacing();
 
-    // ── BAO MAT ────────────────────────────────────────────────
     ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.0f, 1.0f), OBFUSCATE(" BAO MAT"));
     ImGui::Spacing();
     ImGui::Checkbox(OBFUSCATE("Bypass Anti-Cheat"), &SWITCH::AntiCheat);
@@ -339,7 +334,6 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     ImGui::Separator();
     ImGui::Spacing();
 
-    // ── DEBUG ──────────────────────────────────────────────────
     ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1.0f),
         OBFUSCATE("frame: %d | ctx: %p | inst: %p"),
         frame,
@@ -355,7 +349,7 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
 }
 
 // ================================================================
-//  JNI_OnLoad — RegisterNatives hook
+//  JNI_OnLoad
 // ================================================================
 extern "C"
 JNIEXPORT jint JNICALL
@@ -394,7 +388,7 @@ JNI_OnLoad(JavaVM* vm, void* reserved) {
 }
 
 // ================================================================
-//  HACK THREAD — BNM attach với retry + fence
+//  HACK THREAD
 // ================================================================
 void* hack_thread(void*) {
     do { sleep(1); } while (!isLibraryLoaded(targetLibName));
@@ -403,18 +397,14 @@ void* hack_thread(void*) {
 
     usleep(500000);
 
-    // ================================================================
-    //  FIX 1: probe dùng BNM::LoadClass typed — không dùng auto
-    //  getClass() trả BNM::LoadClass, bool context OK, nhưng
-    //  đặt type tường minh tránh surprises sau này
-    // ================================================================
     bool attached = false;
     for (int attempt = 0; attempt < 10 && !attached; attempt++) {
         std::atomic_thread_fence(std::memory_order_seq_cst);
 
         AttachIl2Cpp();
 
-        BNM::LoadClass probe(OBFUSCATE("ThrowIO"), OBFUSCATE("PlayerBalance"));
+        // getClass() xử lý OBFUSCATE bên trong — KHÔNG đụng vào
+        auto probe = getClass(OBFUSCATE("PlayerBalance"), OBFUSCATE("ThrowIO"));
         if (probe) {
             attached = true;
             LOGI(OBFUSCATE("ThrowIO: BNM attached — attempt %d"), attempt);
@@ -430,22 +420,22 @@ void* hack_thread(void*) {
         return nullptr;
     }
 
-    // ── Screen helpers ─────────────────────────────────────────
     Menu::Screen_get_height = reinterpret_cast<int(*)()>(
         OBFBNM("UnityEngine", "Screen", "get_height", 0));
     Menu::Screen_get_width  = reinterpret_cast<int(*)()>(
         OBFBNM("UnityEngine", "Screen", "get_width",  0));
 
     // ================================================================
-    //  FIX 2: Class lookup — type tường minh BNM::LoadClass
-    //  KHÔNG dùng auto với getClass() vì khi pass xuống lambda
-    //  compiler thấy 2 conversion operator => ambiguous => BUILD FAIL
-    //  Dùng constructor BNM::LoadClass(namespace, classname) thẳng
+    //  CLASS LOOKUP
+    //  Explicit type BNM::LoadClass thay vì auto
+    //  getClass() vẫn giữ nguyên — nó handle OBFUSCATE đúng cách
+    //  KHÔNG dùng BNM::LoadClass constructor trực tiếp vì OBFUSCATE
+    //  trả ay::obfuscated_data không convert sang std::string được
     // ================================================================
-    BNM::LoadClass balanceClass   (OBFUSCATE("ThrowIO"), OBFUSCATE("PlayerBalance"));
-    BNM::LoadClass charClass      (OBFUSCATE("ThrowIO"), OBFUSCATE("Character"));
-    BNM::LoadClass playerDataClass(OBFUSCATE("ThrowIO"), OBFUSCATE("PlayerData"));
-    BNM::LoadClass charWeaponClass(OBFUSCATE("ThrowIO"), OBFUSCATE("CharWeapon"));
+    BNM::LoadClass balanceClass    = getClass(OBFUSCATE("PlayerBalance"), OBFUSCATE("ThrowIO"));
+    BNM::LoadClass charClass       = getClass(OBFUSCATE("Character"),     OBFUSCATE("ThrowIO"));
+    BNM::LoadClass playerDataClass = getClass(OBFUSCATE("PlayerData"),    OBFUSCATE("ThrowIO"));
+    BNM::LoadClass charWeaponClass = getClass(OBFUSCATE("CharWeapon"),    OBFUSCATE("ThrowIO"));
 
     LOGI(OBFUSCATE("Classes: balance=%d char=%d pdata=%d cweapon=%d"),
          (bool)balanceClass,
@@ -454,36 +444,36 @@ void* hack_thread(void*) {
          (bool)charWeaponClass);
 
     // ================================================================
-    //  FIX 3: safe_offset — THE MAIN FIX boss man
+    //  THE ACTUAL FIX — boss man đây là cái đang xảy ra:
     //
-    //  CŨ (vãi, bị lỗi):
-    //    auto safe_offset = [](void* cls, ...) -> uintptr_t
-    //    BNM::LoadClass có 2 operator: Il2CppType* và MonoType*
-    //    Compiler: "mày muốn convert thằng nào?" => ambiguous => DEAD
+    //  VẤN ĐỀ GỐC:
+    //    Lambda nhận void* cls
+    //    BNM::LoadClass có HAI operator conversion:
+    //      - operator IL2CPP::Il2CppType*()   (line 309)
+    //      - operator MonoType*()              (line 310)
+    //    Cả hai đều convert sang void* được → compiler không biết chọn cái nào
+    //    → error: conversion from 'LoadClass' to 'void *' is ambiguous
     //
-    //  MỚI (fuck yeah):
-    //    Nhận thẳng BNM::LoadClass — không conversion nào cần thiết
-    //    Dùng GetMethod(name, -1).GetOffset() thay getOffset(void*, name)
-    //    -1 = match bất kỳ overload, không cần biết số arg
+    //  FIX:
+    //    1. Lambda nhận BNM::LoadClass thẳng — không cần conversion ở call site
+    //    2. Bên trong lambda, dùng static_cast<IL2CPP::Il2CppType*> tường minh
+    //       → chọn đúng MỘT conversion operator
+    //    3. Sau đó cast sang void* để pass vào getOffset(void*, name)
+    //    → Không còn ambiguity ở BẤT KỲ điểm nào
     // ================================================================
     auto safe_offset = [](BNM::LoadClass cls, const char* name) -> uintptr_t {
         if (!cls) {
-            LOGE(OBFUSCATE("ThrowIO: null class cho method [%s] — bỏ qua"), name);
+            LOGE(OBFUSCATE("ThrowIO: null class cho [%s]"), name);
             return 0;
         }
-        auto method = cls.GetMethod(name, -1);
-        if (!method) {
-            LOGE(OBFUSCATE("ThrowIO: method không thấy [%s] — kiểm tra tên lại"), name);
-            return 0;
-        }
-        auto off = reinterpret_cast<uintptr_t>(method.GetOffset());
-        if (!off) {
-            LOGE(OBFUSCATE("ThrowIO: offset = 0 cho [%s], đm"), name);
-        }
+        // Tường minh chọn IL2CPP::Il2CppType* — giết ambiguity
+        IL2CPP::Il2CppType* typePtr = static_cast<IL2CPP::Il2CppType*>(cls);
+        void* clsVoid               = static_cast<void*>(typePtr);
+        auto  off                   = getOffset(clsVoid, name);
+        if (!off) LOGE(OBFUSCATE("ThrowIO: offset 0 cho [%s], đm"), name);
         return off;
     };
 
-    // ── Resolve offsets — giờ không còn lỗi ambiguous nữa ─────
     auto off_setSoftMoney = safe_offset(balanceClass,    OBFUSCATE("set_SoftMoney"));
     auto off_setHardMoney = safe_offset(balanceClass,    OBFUSCATE("set_HardMoney"));
     auto off_setLevel     = safe_offset(balanceClass,    OBFUSCATE("set_Level"));
@@ -507,7 +497,6 @@ void* hack_thread(void*) {
          reinterpret_cast<void*>(off_cwUpdate),
          reinterpret_cast<void*>(off_saveLocal));
 
-    // ── AddPointer ─────────────────────────────────────────────
     if (off_setSoftMoney) AddPointer(set_SoftMoney, off_setSoftMoney);
     if (off_setHardMoney) AddPointer(set_HardMoney, off_setHardMoney);
     if (off_setLevel)     AddPointer(set_Level,     off_setLevel);
@@ -519,10 +508,8 @@ void* hack_thread(void*) {
 
     DetachIl2Cpp();
 
-    // Fence trước DHK — pointer writes visible cross-thread
     std::atomic_thread_fence(std::memory_order_seq_cst);
 
-    // ── DobbyHook installs ─────────────────────────────────────
     if (off_setSoftMoney) DHK(off_setSoftMoney, capture_set_SoftMoney,  orig_set_SoftMoney);
     if (off_applyDamage)  DHK(off_applyDamage,  hook_ApplyDamage,       old_ApplyDamage);
     if (off_setDeath)     DHK(off_setDeath,      hook_SetDeath,          old_SetDeath);
@@ -535,7 +522,7 @@ void* hack_thread(void*) {
 }
 
 // ================================================================
-//  ENTRY POINT — __attribute__((constructor))
+//  ENTRY POINT
 // ================================================================
 __attribute__((constructor))
 void lib_main() {
