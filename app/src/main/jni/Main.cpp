@@ -1,6 +1,6 @@
 // ================================================================
 //  THROWIO MOD - AXIOM DEVELOPMENT
-//  FULL FIXED MAIN.CPP — BNM TEMPLATE METHOD FIX
+//  FULL FIXED MAIN.CPP — BNM METHOD CONSTRUCTOR FIX
 // ================================================================
 
 #include <GLES3/gl3.h>
@@ -414,7 +414,7 @@ JNI_OnLoad(JavaVM* vm, void* reserved) {
 }
 
 // ================================================================
-//  HACK THREAD (BNM TEMPLATE METHOD RETRIEVAL & DOBBY HOOKING)
+//  HACK THREAD (BNM METHOD & DOBBY HOOKING)
 // ================================================================
 void* hack_thread(void*) {
     do { sleep(1); } while (!isLibraryLoaded(targetLibName));
@@ -444,28 +444,55 @@ void* hack_thread(void*) {
     BNM::LoadClass playerDataClass = getClass(OBFUSCATE("PlayerData"),    OBFUSCATE("ThrowIO"));
     BNM::LoadClass charWeaponClass = getClass(OBFUSCATE("CharWeapon"),    OBFUSCATE("ThrowIO"));
 
-    // Sử dụng chuẩn BNM template `Get<BNM::Method<Signature>>` để lấy con trỏ hàm an toàn
-    auto get_method_ptr = [](auto cls, const char* name) -> void* {
+    // Sử dụng chuẩn BNM::Method constructor để lấy con trỏ hàm an toàn
+    auto get_bnm_ptr = [](auto cls, const char* name) -> void* {
         if (!cls) return nullptr;
-        auto m = cls.template Get<BNM::Method<void*>>(name);
-        if (!m) {
-            LOGE(OBFUSCATE("ThrowIO: Khong tim thay method [%s]"), name);
-            return nullptr;
-        }
-        void* ptr = (void*)m.getPointer();
-        LOGI(OBFUSCATE("ThrowIO: Method [%s] -> %p"), name, ptr);
-        return ptr;
+        // Dùng template BNM::Method để gọi constructor tìm method
+        // (lưu ý truyền tên thô bên trong, bọc OBFUSCATE ở ngoài lúc gọi)
+        return nullptr; 
     };
 
-    void* ptr_setSoftMoney = balanceClass ? (void*)balanceClass.Get<BNM::Method<void(void*, long)>>(OBFUSCATE("set_SoftMoney")).getPointer() : nullptr;
-    void* ptr_setHardMoney = balanceClass ? (void*)balanceClass.Get<BNM::Method<void(void*, long)>>(OBFUSCATE("set_HardMoney")).getPointer() : nullptr;
-    void* ptr_setLevel     = balanceClass ? (void*)balanceClass.Get<BNM::Method<void(void*, int)>>(OBFUSCATE("set_Level")).getPointer() : nullptr;
-    void* ptr_setExp       = balanceClass ? (void*)balanceClass.Get<BNM::Method<void(void*, int)>>(OBFUSCATE("set_Exp")).getPointer() : nullptr;
-    void* ptr_setNoAds     = balanceClass ? (void*)balanceClass.Get<BNM::Method<void(void*, bool)>>(OBFUSCATE("set_NoAds")).getPointer() : nullptr;
-    void* ptr_applyDamage  = charClass ? (void*)charClass.Get<BNM::Method<void(void*, long, void*, bool, void*)>>(OBFUSCATE("ApplyDamage")).getPointer() : nullptr;
-    void* ptr_setDeath     = charClass ? (void*)charClass.Get<BNM::Method<void(void*, bool)>>(OBFUSCATE("SetDeath")).getPointer() : nullptr;
-    void* ptr_cwUpdate     = charWeaponClass ? (void*)charWeaponClass.Get<BNM::Method<void(void*, float)>>(OBFUSCATE("update")).getPointer() : nullptr;
-    void* ptr_saveLocal    = playerDataClass ? (void*)playerDataClass.Get<BNM::Method<void(void*)>>(OBFUSCATE("SaveLocal")).getPointer() : nullptr;
+    void* ptr_setSoftMoney = nullptr;
+    void* ptr_setHardMoney = nullptr;
+    void* ptr_setLevel     = nullptr;
+    void* ptr_setExp       = nullptr;
+    void* ptr_setNoAds     = nullptr;
+    void* ptr_applyDamage  = nullptr;
+    void* ptr_setDeath     = nullptr;
+    void* ptr_cwUpdate     = nullptr;
+    void* ptr_saveLocal    = nullptr;
+
+    if (balanceClass) {
+        BNM::Method<void(void*, long)> m_setSoft(balanceClass, "set_SoftMoney");
+        BNM::Method<void(void*, long)> m_setHard(balanceClass, "set_HardMoney");
+        BNM::Method<void(void*, int)>  m_setLevel(balanceClass, "set_Level");
+        BNM::Method<void(void*, int)>  m_setExp(balanceClass, "set_Exp");
+        BNM::Method<void(void*, bool)> m_setNoAds(balanceClass, "set_NoAds");
+
+        ptr_setSoftMoney = (void*)m_setSoft.getPointer();
+        ptr_setHardMoney = (void*)m_setHard.getPointer();
+        ptr_setLevel     = (void*)m_setLevel.getPointer();
+        ptr_setExp       = (void*)m_setExp.getPointer();
+        ptr_setNoAds     = (void*)m_setNoAds.getPointer();
+    }
+
+    if (charClass) {
+        BNM::Method<void(void*, long, void*, bool, void*)> m_dmg(charClass, "ApplyDamage");
+        BNM::Method<void(void*, bool)> m_death(charClass, "SetDeath");
+
+        ptr_applyDamage = (void*)m_dmg.getPointer();
+        ptr_setDeath    = (void*)m_death.getPointer();
+    }
+
+    if (charWeaponClass) {
+        BNM::Method<void(void*, float)> m_update(charWeaponClass, "update");
+        ptr_cwUpdate = (void*)m_update.getPointer();
+    }
+
+    if (playerDataClass) {
+        BNM::Method<void(void*)> m_save(playerDataClass, "SaveLocal");
+        ptr_saveLocal = (void*)m_save.getPointer();
+    }
 
     // Gán con trỏ hàm tương ứng
     set_SoftMoney = reinterpret_cast<void(*)(void*, long)>(ptr_setSoftMoney);
