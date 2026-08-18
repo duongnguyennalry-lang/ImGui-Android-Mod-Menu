@@ -176,7 +176,6 @@ static bool SafeSetupImGui(EGLDisplay dpy, EGLSurface surface) {
     g_savedDisplay = eglGetCurrentDisplay();
     g_savedContext = eglGetCurrentContext();
 
-    // Flush GL error state trước khi setup
     while (glGetError() != GL_NO_ERROR) {}
 
     SetupImGui();
@@ -202,7 +201,6 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     eglQuerySurface(dpy, surface, EGL_WIDTH,  &w);
     eglQuerySurface(dpy, surface, EGL_HEIGHT, &h);
 
-    // Surface belum siap — pass through langsung
     if (w <= 0 || h <= 0) return old_eglSwapBuffers(dpy, surface);
 
     glWidth  = w;
@@ -210,10 +208,8 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
 
     int frame = g_frameCount.fetch_add(1, std::memory_order_relaxed);
 
-    // Skip 30 frame đầu — splash screen, EGL chưa stable
     if (frame < 30) return old_eglSwapBuffers(dpy, surface);
 
-    // Nếu setup đã fail, retry mỗi 60 frame
     if (g_imguiFailed.load(std::memory_order_acquire)) {
         if (frame % 60 != 0) return old_eglSwapBuffers(dpy, surface);
         LOGI(OBFUSCATE("ThrowIO: retrying ImGui setup — frame %d"), frame);
@@ -222,7 +218,6 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
         g_eglReady.store(false,   std::memory_order_release);
     }
 
-    // Setup ImGui sekali saja, dengan full EGL validation
     if (!g_imguiSetup.load(std::memory_order_acquire)) {
         bool ok = SafeSetupImGui(dpy, surface);
         if (ok) {
@@ -237,7 +232,6 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     if (!g_eglReady.load(std::memory_order_acquire))
         return old_eglSwapBuffers(dpy, surface);
 
-    // Validate EGL context vẫn live — tránh crash khi surface recreate
     if (!IsEGLContextCurrent()) {
         LOGE(OBFUSCATE("ThrowIO: EGL context lost — frame %d, resetting ImGui"), frame);
         g_imguiSetup.store(false, std::memory_order_release);
@@ -247,7 +241,6 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
         return old_eglSwapBuffers(dpy, surface);
     }
 
-    // Watchdog chỉ chạy khi hooks đã install xong
     if (g_hooksReady.load(std::memory_order_acquire)) {
         ApplyWatchdog();
     }
@@ -404,25 +397,24 @@ JNI_OnLoad(JavaVM* vm, void* reserved) {
 //  HACK THREAD — BNM attach với retry + fence
 // ================================================================
 void* hack_thread(void*) {
-    // Chờ il2cpp lib load vào process
     do { sleep(1); } while (!isLibraryLoaded(targetLibName));
     address = findLibrary(targetLibName);
     LOGI(OBFUSCATE("ThrowIO: il2cpp detected @ %p"), reinterpret_cast<void*>(address));
 
-    // CRITICAL: lib loaded != il2cpp domain ready
-    // Domain init chạy async sau dlopen — thiếu delay này là SIGSEGV
-    usleep(500000); // 500ms buffer
+    usleep(500000);
 
-    // Retry AttachIl2Cpp tối đa 10 lần với validation
+    // ================================================================
+    //  FIX 1: probe dùng BNM::LoadClass typed — không dùng auto
+    //  getClass() trả BNM::LoadClass, bool context OK, nhưng
+    //  đặt type tường minh tránh surprises sau này
+    // ================================================================
     bool attached = false;
     for (int attempt = 0; attempt < 10 && !attached; attempt++) {
-        // Memory fence — đảm bảo tất cả writes từ loader thread visible
         std::atomic_thread_fence(std::memory_order_seq_cst);
 
         AttachIl2Cpp();
 
-        // Validate bằng cách probe class thật — không dùng return value AttachIl2Cpp
-        auto probe = getClass(OBFUSCATE("PlayerBalance"), OBFUSCATE("ThrowIO"));
+        BNM::LoadClass probe(OBFUSCATE("ThrowIO"), OBFUSCATE("PlayerBalance"));
         if (probe) {
             attached = true;
             LOGI(OBFUSCATE("ThrowIO: BNM attached — attempt %d"), attempt);
@@ -444,23 +436,54 @@ void* hack_thread(void*) {
     Menu::Screen_get_width  = reinterpret_cast<int(*)()>(
         OBFBNM("UnityEngine", "Screen", "get_width",  0));
 
-    // ── Class lookup ───────────────────────────────────────────
-    auto balanceClass    = getClass(OBFUSCATE("PlayerBalance"), OBFUSCATE("ThrowIO"));
-    auto charClass       = getClass(OBFUSCATE("Character"),     OBFUSCATE("ThrowIO"));
-    auto playerDataClass = getClass(OBFUSCATE("PlayerData"),    OBFUSCATE("ThrowIO"));
-    auto charWeaponClass = getClass(OBFUSCATE("CharWeapon"),    OBFUSCATE("ThrowIO"));
+    // ================================================================
+    //  FIX 2: Class lookup — type tường minh BNM::LoadClass
+    //  KHÔNG dùng auto với getClass() vì khi pass xuống lambda
+    //  compiler thấy 2 conversion operator => ambiguous => BUILD FAIL
+    //  Dùng constructor BNM::LoadClass(namespace, classname) thẳng
+    // ================================================================
+    BNM::LoadClass balanceClass   (OBFUSCATE("ThrowIO"), OBFUSCATE("PlayerBalance"));
+    BNM::LoadClass charClass      (OBFUSCATE("ThrowIO"), OBFUSCATE("Character"));
+    BNM::LoadClass playerDataClass(OBFUSCATE("ThrowIO"), OBFUSCATE("PlayerData"));
+    BNM::LoadClass charWeaponClass(OBFUSCATE("ThrowIO"), OBFUSCATE("CharWeapon"));
 
-    LOGI(OBFUSCATE("Classes: balance=%p char=%p pdata=%p cweapon=%p"),
-         balanceClass, charClass, playerDataClass, charWeaponClass);
+    LOGI(OBFUSCATE("Classes: balance=%d char=%d pdata=%d cweapon=%d"),
+         (bool)balanceClass,
+         (bool)charClass,
+         (bool)playerDataClass,
+         (bool)charWeaponClass);
 
-    // ── Safe offset resolver ───────────────────────────────────
-    auto safe_offset = [](void* cls, const char* name) -> uintptr_t {
-        if (!cls) { LOGE(OBFUSCATE("ThrowIO: null class for %s"), name); return 0; }
-        auto off = getOffset(cls, name);
-        if (!off) LOGE(OBFUSCATE("ThrowIO: offset missing: %s"), name);
+    // ================================================================
+    //  FIX 3: safe_offset — THE MAIN FIX boss man
+    //
+    //  CŨ (vãi, bị lỗi):
+    //    auto safe_offset = [](void* cls, ...) -> uintptr_t
+    //    BNM::LoadClass có 2 operator: Il2CppType* và MonoType*
+    //    Compiler: "mày muốn convert thằng nào?" => ambiguous => DEAD
+    //
+    //  MỚI (fuck yeah):
+    //    Nhận thẳng BNM::LoadClass — không conversion nào cần thiết
+    //    Dùng GetMethod(name, -1).GetOffset() thay getOffset(void*, name)
+    //    -1 = match bất kỳ overload, không cần biết số arg
+    // ================================================================
+    auto safe_offset = [](BNM::LoadClass cls, const char* name) -> uintptr_t {
+        if (!cls) {
+            LOGE(OBFUSCATE("ThrowIO: null class cho method [%s] — bỏ qua"), name);
+            return 0;
+        }
+        auto method = cls.GetMethod(name, -1);
+        if (!method) {
+            LOGE(OBFUSCATE("ThrowIO: method không thấy [%s] — kiểm tra tên lại"), name);
+            return 0;
+        }
+        auto off = reinterpret_cast<uintptr_t>(method.GetOffset());
+        if (!off) {
+            LOGE(OBFUSCATE("ThrowIO: offset = 0 cho [%s], đm"), name);
+        }
         return off;
     };
 
+    // ── Resolve offsets — giờ không còn lỗi ambiguous nữa ─────
     auto off_setSoftMoney = safe_offset(balanceClass,    OBFUSCATE("set_SoftMoney"));
     auto off_setHardMoney = safe_offset(balanceClass,    OBFUSCATE("set_HardMoney"));
     auto off_setLevel     = safe_offset(balanceClass,    OBFUSCATE("set_Level"));
@@ -496,7 +519,7 @@ void* hack_thread(void*) {
 
     DetachIl2Cpp();
 
-    // Fence trước DHK — đảm bảo pointer writes visible cross-thread
+    // Fence trước DHK — pointer writes visible cross-thread
     std::atomic_thread_fence(std::memory_order_seq_cst);
 
     // ── DobbyHook installs ─────────────────────────────────────
@@ -506,7 +529,6 @@ void* hack_thread(void*) {
     if (off_cwUpdate)     DHK(off_cwUpdate,      hook_CharWeapon_update, old_CharWeapon_update);
     if (off_saveLocal)    DHK(off_saveLocal,      hook_SaveLocal,         old_SaveLocal);
 
-    // Signal eglSwapBuffers — hooks live, watchdog safe to run
     g_hooksReady.store(true, std::memory_order_release);
     LOGI(OBFUSCATE("ThrowIO: All hooks installed — that's what the hell is going on"));
     return nullptr;
@@ -517,17 +539,15 @@ void* hack_thread(void*) {
 // ================================================================
 __attribute__((constructor))
 void lib_main() {
-    // CrashLogger HARUS dòng đầu tiên
     InitCrashLogger();
     LOGI(OBFUSCATE("ThrowIO: lib_main start"));
 
-    // ── EGL dlopen với exponential backoff ────────────────────
     void* eglhandle = nullptr;
     for (int retry = 0; retry < 30 && !eglhandle; retry++) {
         eglhandle = dlopen(OBFUSCATE("libEGL.so"), RTLD_NOW | RTLD_GLOBAL);
         if (!eglhandle) {
             LOGE(OBFUSCATE("ThrowIO: libEGL.so retry %d — %s"), retry, dlerror());
-            usleep(100000); // 100ms per retry = max 3 detik total
+            usleep(100000);
         }
     }
 
@@ -545,13 +565,11 @@ void lib_main() {
     DHK(eglSwapBuffersSym, hook_eglSwapBuffers, old_eglSwapBuffers);
     LOGI(OBFUSCATE("ThrowIO: eglSwapBuffers hooked -> %p"), eglSwapBuffersSym);
 
-    // ── hack_thread với 4MB stack ─────────────────────────────
-    // BNM class scan stack-heavy — default 64KB không đủ
     pthread_t ptid;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    pthread_attr_setstacksize(&attr, 4 * 1024 * 1024); // 4MB
+    pthread_attr_setstacksize(&attr, 4 * 1024 * 1024);
 
     if (pthread_create(&ptid, &attr, hack_thread, nullptr) != 0) {
         LOGE(OBFUSCATE("ThrowIO: pthread_create failed"));
