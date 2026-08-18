@@ -3,7 +3,24 @@
 
 // ================================================================
 //  THROWIO MOD - AXIOM DEVELOPMENT
-//  VERSION: FINAL — EGL race fix + BNM fence + ImGui safe init
+//  VERSION: CRASH FIX — deterministic SIGSEGV 0x86694
+//
+//  ROOT CAUSE (đã xác định từ log):
+//    - fault addr 0xec1e36c9a0 GIỐNG NHAU cả 2 crash = bad fn pointer
+//    - call chain: libunity → libDuongdev offset 0x86694
+//    - = hook_eglSwapBuffers gọi SetupImGui() / ImGui GL backend
+//      khi GL function pointers chưa được load → gọi null/garbage ptr
+//    - frame warmup 30 KHÔNG ĐỦ cho Unity khởi tạo GL state
+//
+//  FIXES APPLIED:
+//    [1] Warmup tăng 30 → 90 frames
+//    [2] Guard EGL_NO_SURFACE trước eglQuerySurface
+//    [3] Check eglQuerySurface return value
+//    [4] GL smoke test (glGetIntegerv) trước khi cho phép ImGui init
+//    [5] ImGui context null check trước NewFrame
+//    [6] IsValidPtr — fix mincore() size alignment
+//    [7] hack_thread — poll il2cpp domain ready trước AttachIl2Cpp
+//    [8] Tăng initial delay 500ms → 1500ms cho il2cpp metadata warm
 // ================================================================
 
 // ================================================================
@@ -48,6 +65,7 @@ static std::atomic<bool> g_eglReady{false};
 static std::atomic<bool> g_imguiSetup{false};
 static std::atomic<bool> g_hooksReady{false};
 static std::atomic<bool> g_imguiFailed{false};
+static std::atomic<int>  g_failCount{0};   // [FIX 1] track consecutive failures
 
 static EGLDisplay        g_savedDisplay = EGL_NO_DISPLAY;
 static EGLContext        g_savedContext = EGL_NO_CONTEXT;
@@ -55,14 +73,39 @@ static EGLContext        g_savedContext = EGL_NO_CONTEXT;
 EGLBoolean (*old_eglSwapBuffers)(EGLDisplay, EGLSurface) = nullptr;
 
 // ================================================================
-//  UTIL: Validate EGL context
+//  [FIX 6] IsValidPtr — mincore cần page-aligned length
+//  Bug cũ: mincore(page, 1, &vec) — sz=1 không aligned
+//  Một số kernel check strict alignment → undefined behavior
+// ================================================================
+static bool IsValidPtr(const void* ptr, size_t sz = sizeof(void*)) {
+    if (!ptr) return false;
+    // Không deref address quá cao — arm64 user space max ~0x7fffffffffff
+    if (reinterpret_cast<uintptr_t>(ptr) > 0x7fffffffffffULL) return false;
+
+    long pageSize = sysconf(_SC_PAGESIZE);
+    if (pageSize <= 0) pageSize = 4096;
+
+    uintptr_t page = reinterpret_cast<uintptr_t>(ptr)
+                     & ~static_cast<uintptr_t>(pageSize - 1);
+
+    // [FIX 6] mincore length phải là bội số của pageSize
+    size_t alignedSz = (sz + static_cast<size_t>(pageSize) - 1)
+                       & ~static_cast<size_t>(pageSize - 1);
+    if (alignedSz == 0) alignedSz = static_cast<size_t>(pageSize);
+
+    unsigned char vec = 0;
+    return mincore(reinterpret_cast<void*>(page), alignedSz, &vec) == 0;
+}
+
+// ================================================================
+//  IsEGLContextCurrent
 // ================================================================
 static bool IsEGLContextCurrent() {
     EGLDisplay dpy = eglGetCurrentDisplay();
     EGLContext  ctx = eglGetCurrentContext();
     if (dpy == EGL_NO_DISPLAY || ctx == EGL_NO_CONTEXT) return false;
     if (g_savedContext != EGL_NO_CONTEXT && ctx != g_savedContext) {
-        LOGE(OBFUSCATE("ThrowIO: EGL context mismatch — saved=%p current=%p"),
+        LOGE(OBFUSCATE("ThrowIO: EGL context mismatch saved=%p current=%p"),
              g_savedContext, ctx);
         return false;
     }
@@ -70,18 +113,43 @@ static bool IsEGLContextCurrent() {
 }
 
 // ================================================================
-//  UTIL: Validate pointer bộ nhớ
+//  [FIX 4] GL Smoke Test — kiểm tra GL thực sự hoạt động
+//  Đây là nguyên nhân crash offset 0x86694:
+//  ImGui OpenGL3 backend gọi glGetIntegerv / glGenTextures ngay khi init
+//  Nếu GL function pointers chưa load → crash tại bad fn pointer
 // ================================================================
-static bool IsValidPtr(const void* ptr, size_t sz = 1) {
-    if (!ptr) return false;
-    unsigned char vec = 0;
-    uintptr_t page = reinterpret_cast<uintptr_t>(ptr)
-                     & ~static_cast<uintptr_t>(sysconf(_SC_PAGESIZE) - 1);
-    return mincore(reinterpret_cast<void*>(page), sz, &vec) == 0;
+static bool IsGLReady() {
+    // Flush error state trước
+    while (glGetError() != GL_NO_ERROR) {}
+
+    // Probe: đọc GL_MAJOR_VERSION — nếu GL chưa ready sẽ trả về error
+    GLint major = 0;
+    glGetIntegerv(GL_MAJOR_VERSION, &major);
+
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) {
+        LOGE(OBFUSCATE("ThrowIO: GL not ready — glGetIntegerv err=0x%x"), err);
+        return false;
+    }
+    if (major < 2) {
+        LOGE(OBFUSCATE("ThrowIO: GL version too low — major=%d"), major);
+        return false;
+    }
+
+    // Probe 2: viewport phải có kích thước hợp lệ
+    GLint viewport[4] = {0};
+    glGetIntegerv(GL_VIEWPORT, viewport);
+    if (glGetError() != GL_NO_ERROR || viewport[2] <= 0 || viewport[3] <= 0) {
+        LOGE(OBFUSCATE("ThrowIO: GL viewport invalid [%d %d %d %d]"),
+             viewport[0], viewport[1], viewport[2], viewport[3]);
+        return false;
+    }
+
+    return true;
 }
 
 // ================================================================
-//  UTIL: ApplyWatchdog
+//  ApplyWatchdog
 // ================================================================
 static inline void ApplyWatchdog() {
     void* inst = g_BalanceInstance;
@@ -129,7 +197,7 @@ void hook_CharWeapon_update(void* instance, float deltaTime) {
 }
 
 // ================================================================
-//  HOOK: SaveLocal — Anti-Cheat sandwich
+//  HOOK: SaveLocal — Anti-Cheat
 // ================================================================
 void hook_SaveLocal(void* instance) {
     if (SWITCH::AntiCheat) ApplyWatchdog();
@@ -164,48 +232,90 @@ static void ApplyImGuiStyle() {
 }
 
 // ================================================================
-//  SafeSetupImGui
+//  SafeSetupImGui — với GL smoke test
 // ================================================================
 static bool SafeSetupImGui(EGLDisplay dpy, EGLSurface surface) {
     if (!IsEGLContextCurrent()) {
-        LOGE(OBFUSCATE("ThrowIO: SafeSetupImGui — no valid EGL context, skip"));
+        LOGE(OBFUSCATE("ThrowIO: SafeSetupImGui — no valid EGL context"));
         return false;
     }
+
+    // [FIX 4] GL phải ready trước khi ImGui OpenGL3 backend init
+    if (!IsGLReady()) {
+        LOGE(OBFUSCATE("ThrowIO: SafeSetupImGui — GL not ready, skip"));
+        return false;
+    }
+
     g_savedDisplay = eglGetCurrentDisplay();
     g_savedContext = eglGetCurrentContext();
+
     while (glGetError() != GL_NO_ERROR) {}
+
     SetupImGui();
-    GLenum glErr = glGetError();
-    if (glErr != GL_NO_ERROR) {
-        LOGE(OBFUSCATE("ThrowIO: SetupImGui GL error 0x%x — will retry"), glErr);
+
+    // [FIX 5] Verify ImGui context tồn tại sau SetupImGui
+    ImGuiContext* imCtx = ImGui::GetCurrentContext();
+    if (!imCtx) {
+        LOGE(OBFUSCATE("ThrowIO: SetupImGui returned null context — sẽ retry"));
         return false;
     }
+
+    GLenum glErr = glGetError();
+    if (glErr != GL_NO_ERROR) {
+        LOGE(OBFUSCATE("ThrowIO: SetupImGui GL error 0x%x — retry"), glErr);
+        return false;
+    }
+
     ApplyImGuiStyle();
-    LOGI(OBFUSCATE("ThrowIO: ImGui setup OK — ctx=%p dpy=%p"),
+    LOGI(OBFUSCATE("ThrowIO: ImGui setup OK ctx=%p dpy=%p"),
          g_savedContext, g_savedDisplay);
     return true;
 }
 
 // ================================================================
-//  HOOK: eglSwapBuffers
+//  HOOK: eglSwapBuffers — crash-resistant version
 // ================================================================
 EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
+    // Guard: original function phải tồn tại
     if (!old_eglSwapBuffers) return EGL_FALSE;
 
+    // [FIX 2] Guard: EGL_NO_SURFACE crash — một số Unity version gọi
+    // eglSwapBuffers với surface null trong quá trình khởi tạo
+    if (dpy == EGL_NO_DISPLAY || surface == EGL_NO_SURFACE)
+        return old_eglSwapBuffers(dpy, surface);
+
+    // Guard: context phải có trên thread này
+    if (eglGetCurrentContext() == EGL_NO_CONTEXT)
+        return old_eglSwapBuffers(dpy, surface);
+
+    // [FIX 3] Check return value của eglQuerySurface
     EGLint w = 0, h = 0;
-    eglQuerySurface(dpy, surface, EGL_WIDTH,  &w);
-    eglQuerySurface(dpy, surface, EGL_HEIGHT, &h);
+    if (eglQuerySurface(dpy, surface, EGL_WIDTH,  &w) != EGL_TRUE ||
+        eglQuerySurface(dpy, surface, EGL_HEIGHT, &h) != EGL_TRUE) {
+        LOGE(OBFUSCATE("ThrowIO: eglQuerySurface failed — skip frame"));
+        return old_eglSwapBuffers(dpy, surface);
+    }
+
     if (w <= 0 || h <= 0) return old_eglSwapBuffers(dpy, surface);
 
     glWidth  = w;
     glHeight = h;
 
     int frame = g_frameCount.fetch_add(1, std::memory_order_relaxed);
-    if (frame < 30) return old_eglSwapBuffers(dpy, surface);
 
+    // [FIX 1] Tăng warmup 30 → 90 frames
+    // 30 frame KHÔNG ĐỦ cho Unity GL state init hoàn toàn
+    // fault addr 0xec1e36c9a0 = ImGui gọi GL fn pointer chưa load
+    if (frame < 90) return old_eglSwapBuffers(dpy, surface);
+
+    // Retry logic — backoff tăng dần nếu fail nhiều lần
     if (g_imguiFailed.load(std::memory_order_acquire)) {
-        if (frame % 60 != 0) return old_eglSwapBuffers(dpy, surface);
-        LOGI(OBFUSCATE("ThrowIO: retrying ImGui setup — frame %d"), frame);
+        int fails = g_failCount.load(std::memory_order_relaxed);
+        // Backoff: fail ít → retry sau 60 frame, fail nhiều → 180 frame
+        int retryInterval = (fails < 3) ? 60 : (fails < 6) ? 120 : 180;
+        if (frame % retryInterval != 0) return old_eglSwapBuffers(dpy, surface);
+
+        LOGI(OBFUSCATE("ThrowIO: retry ImGui setup — frame=%d fail#%d"), frame, fails);
         g_imguiFailed.store(false, std::memory_order_release);
         g_imguiSetup.store(false,  std::memory_order_release);
         g_eglReady.store(false,    std::memory_order_release);
@@ -214,9 +324,11 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     if (!g_imguiSetup.load(std::memory_order_acquire)) {
         bool ok = SafeSetupImGui(dpy, surface);
         if (ok) {
+            g_failCount.store(0, std::memory_order_relaxed); // reset fail counter
             g_imguiSetup.store(true, std::memory_order_release);
             g_eglReady.store(true,   std::memory_order_release);
         } else {
+            g_failCount.fetch_add(1, std::memory_order_relaxed);
             g_imguiFailed.store(true, std::memory_order_release);
             return old_eglSwapBuffers(dpy, surface);
         }
@@ -226,11 +338,20 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
         return old_eglSwapBuffers(dpy, surface);
 
     if (!IsEGLContextCurrent()) {
-        LOGE(OBFUSCATE("ThrowIO: EGL context lost — frame %d, resetting"), frame);
+        LOGE(OBFUSCATE("ThrowIO: EGL context lost — frame=%d reset ImGui"), frame);
         g_imguiSetup.store(false, std::memory_order_release);
         g_eglReady.store(false,   std::memory_order_release);
         g_savedContext = EGL_NO_CONTEXT;
         g_savedDisplay = EGL_NO_DISPLAY;
+        return old_eglSwapBuffers(dpy, surface);
+    }
+
+    // [FIX 5] ImGui context null check trước MỌI ImGui call
+    ImGuiContext* imCtx = ImGui::GetCurrentContext();
+    if (!imCtx) {
+        LOGE(OBFUSCATE("ThrowIO: ImGui context null — reset"));
+        g_imguiSetup.store(false, std::memory_order_release);
+        g_eglReady.store(false,   std::memory_order_release);
         return old_eglSwapBuffers(dpy, surface);
     }
 
@@ -240,12 +361,13 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     ImGui_ImplAndroid_NewFrame();
     ImGui::NewFrame();
 
-    ImGui::SetNextWindowSize(ImVec2(370, 520), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(370, 540), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(10, 10),    ImGuiCond_FirstUseEver);
     ImGui::Begin(OBFUSCATE("THROWIO MOD - AXIOM"), nullptr,
                  ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize);
 
-    ImGui::TextColored(ImVec4(0.0f, 0.8f, 1.0f, 1.0f), OBFUSCATE("  AXIOM DEVELOPMENT"));
+    ImGui::TextColored(ImVec4(0.0f, 0.8f, 1.0f, 1.0f),
+                       OBFUSCATE("  AXIOM DEVELOPMENT"));
     ImGui::Separator();
     ImGui::Spacing();
 
@@ -254,11 +376,13 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
 
     ImGui::TextColored(
         hooksLive ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f) : ImVec4(1.0f, 0.85f, 0.0f, 1.0f),
-        hooksLive ? OBFUSCATE("  [OK] Hooks Live") : OBFUSCATE("  [..] Dang Hook — cho chut...")
+        hooksLive ? OBFUSCATE("  [OK] Hooks Live")
+                  : OBFUSCATE("  [..] Dang Hook — cho chut...")
     );
     ImGui::TextColored(
         connected ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f) : ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
-        connected ? OBFUSCATE("  [OK] Instance Bat Duoc") : OBFUSCATE("  [..] Chua Co Instance — vao man choi")
+        connected ? OBFUSCATE("  [OK] Instance Bat Duoc")
+                  : OBFUSCATE("  [..] Chua Co Instance — vao man choi")
     );
 
     ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
@@ -310,11 +434,13 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
 
     ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
 
+    int fails = g_failCount.load(std::memory_order_relaxed);
     ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1.0f),
-        OBFUSCATE("frame: %d | ctx: %p | inst: %p"),
+        OBFUSCATE("frame=%d | ctx=%p | inst=%p | retry=%d"),
         frame,
         reinterpret_cast<void*>(g_savedContext),
-        g_BalanceInstance
+        g_BalanceInstance,
+        fails
     );
 
     ImGui::End();
@@ -336,7 +462,8 @@ JNI_OnLoad(JavaVM* vm, void* reserved) {
         return JNI_VERSION_1_6;
     }
 
-    UnityPlayer_cls = globalEnv->FindClass(OBFUSCATE("com/unity3d/player/UnityPlayer"));
+    UnityPlayer_cls = globalEnv->FindClass(
+        OBFUSCATE("com/unity3d/player/UnityPlayer"));
     if (!UnityPlayer_cls) {
         LOGE(OBFUSCATE("ThrowIO: UnityPlayer class not found"));
         return JNI_VERSION_1_6;
@@ -363,18 +490,73 @@ JNI_OnLoad(JavaVM* vm, void* reserved) {
 }
 
 // ================================================================
+//  [FIX 7] Il2Cpp domain readiness poll
+//  AttachIl2Cpp() đọc domain->assemblies khi init
+//  Nếu domain chưa populated → đọc garbage → crash
+// ================================================================
+static bool WaitForIl2CppDomainReady(uintptr_t baseAddr, int maxWaitMs = 5000) {
+    // il2cpp_domain_get là export tiêu chuẩn
+    // Tìm trong lib đã load, poll cho đến khi trả về non-null
+    typedef void* (*domain_get_fn)();
+    void* libHandle = dlopen(OBFUSCATE("libil2cpp.so"), RTLD_NOW | RTLD_NOLOAD);
+    if (!libHandle) {
+        // il2cpp có thể embedded trong libunity hoặc game lib
+        // fallback: chỉ sleep và hy vọng
+        LOGI(OBFUSCATE("ThrowIO: libil2cpp standalone not found, using timed wait"));
+        usleep(static_cast<useconds_t>(maxWaitMs) * 1000);
+        return true;
+    }
+
+    auto domain_get = reinterpret_cast<domain_get_fn>(
+        dlsym(libHandle, OBFUSCATE("il2cpp_domain_get")));
+
+    if (!domain_get) {
+        dlclose(libHandle);
+        usleep(static_cast<useconds_t>(maxWaitMs) * 1000);
+        return true;
+    }
+
+    int elapsed = 0;
+    const int step = 100; // 100ms per check
+    while (elapsed < maxWaitMs) {
+        void* domain = domain_get();
+        if (domain && IsValidPtr(domain)) {
+            LOGI(OBFUSCATE("ThrowIO: il2cpp domain ready @ %p (waited %dms)"),
+                 domain, elapsed);
+            dlclose(libHandle);
+            return true;
+        }
+        usleep(step * 1000);
+        elapsed += step;
+    }
+
+    LOGE(OBFUSCATE("ThrowIO: il2cpp domain NOT ready after %dms"), maxWaitMs);
+    dlclose(libHandle);
+    return false; // caller decide whether to proceed anyway
+}
+
+// ================================================================
 //  HACK THREAD
 // ================================================================
 void* hack_thread(void*) {
     do { sleep(1); } while (!isLibraryLoaded(targetLibName));
     address = findLibrary(targetLibName);
-    LOGI(OBFUSCATE("ThrowIO: il2cpp detected @ %p"), reinterpret_cast<void*>(address));
+    LOGI(OBFUSCATE("ThrowIO: il2cpp detected @ %p"),
+         reinterpret_cast<void*>(address));
 
-    usleep(500000);
+    // [FIX 8] Tăng initial delay 500ms → 1500ms
+    // 500ms không đủ cho il2cpp metadata init trên thiết bị chậm
+    usleep(1500000);
+
+    // [FIX 7] Poll il2cpp domain trước khi attach
+    // Không bắt buộc thành công — proceed dù sao với backoff
+    WaitForIl2CppDomainReady(address, 3000);
 
     bool attached = false;
-    for (int attempt = 0; attempt < 10 && !attached; attempt++) {
+    for (int attempt = 0; attempt < 15 && !attached; attempt++) {
+        // Tăng từ 10 → 15 attempts
         std::atomic_thread_fence(std::memory_order_seq_cst);
+
         AttachIl2Cpp();
 
         auto probe = getClass(OBFUSCATE("PlayerBalance"), OBFUSCATE("ThrowIO"));
@@ -382,14 +564,15 @@ void* hack_thread(void*) {
             attached = true;
             LOGI(OBFUSCATE("ThrowIO: BNM attached — attempt %d"), attempt);
         } else {
-            LOGE(OBFUSCATE("ThrowIO: attach attempt %d failed, retry 300ms"), attempt);
+            LOGE(OBFUSCATE("ThrowIO: attach attempt %d failed"), attempt);
             DetachIl2Cpp();
-            usleep(300000);
+            // Backoff tăng dần: lần đầu 300ms, sau đó 500ms
+            usleep(attempt < 5 ? 300000 : 500000);
         }
     }
 
     if (!attached) {
-        LOGE(OBFUSCATE("ThrowIO: FATAL — BNM attach failed after 10 attempts"));
+        LOGE(OBFUSCATE("ThrowIO: FATAL — BNM attach failed after 15 attempts"));
         return nullptr;
     }
 
@@ -398,9 +581,6 @@ void* hack_thread(void*) {
     Menu::Screen_get_width  = reinterpret_cast<int(*)()>(
         OBFBNM("UnityEngine", "Screen", "get_width",  0));
 
-    // ================================================================
-    //  CLASS LOOKUP
-    // ================================================================
     BNM::LoadClass balanceClass    = getClass(OBFUSCATE("PlayerBalance"), OBFUSCATE("ThrowIO"));
     BNM::LoadClass charClass       = getClass(OBFUSCATE("Character"),     OBFUSCATE("ThrowIO"));
     BNM::LoadClass playerDataClass = getClass(OBFUSCATE("PlayerData"),    OBFUSCATE("ThrowIO"));
@@ -410,36 +590,16 @@ void* hack_thread(void*) {
          (bool)balanceClass, (bool)charClass,
          (bool)playerDataClass, (bool)charWeaponClass);
 
-    // ================================================================
-    //  THE REAL FIX — boss man đây là cái quan trọng:
-    //
-    //  LỖI GỐC:
-    //    Đoạn code cũ cast LoadClass → Il2CppType* → void*
-    //    rồi pass void* vào getOffset() — nhưng getOffset() không
-    //    có overload nào nhận void*, nó chỉ nhận LoadClass trực tiếp.
-    //    Đm, cast vòng vèo như vậy để làm gì.
-    //
-    //  FIX ĐÚNG:
-    //    Pass thẳng BNM::LoadClass vào getOffset() — không cast gì cả.
-    //    Loader.h line 31: uintptr_t getOffset(LoadClass clasz, const char* M, int param = 0)
-    //    Đó, nhận LoadClass trực tiếp rồi. Xong.
-    // ================================================================
     auto safe_offset = [](BNM::LoadClass cls, const char* name) -> uintptr_t {
         if (!cls) {
-            LOGE(OBFUSCATE("ThrowIO: null class cho [%s] — skip"), name);
+            LOGE(OBFUSCATE("ThrowIO: null class cho [%s]"), name);
             return 0;
         }
-        // ✅ ĐÚNG: pass LoadClass thẳng, default param = 0
         uintptr_t off = getOffset(cls, name, 0);
-        if (!off) {
-            LOGE(OBFUSCATE("ThrowIO: offset = 0 cho [%s] — method không tìm thấy, đm"), name);
-        }
+        if (!off) LOGE(OBFUSCATE("ThrowIO: offset 0 cho [%s]"), name);
         return off;
     };
 
-    // ================================================================
-    //  OFFSET LOOKUP
-    // ================================================================
     auto off_setSoftMoney = safe_offset(balanceClass,    OBFUSCATE("set_SoftMoney"));
     auto off_setHardMoney = safe_offset(balanceClass,    OBFUSCATE("set_HardMoney"));
     auto off_setLevel     = safe_offset(balanceClass,    OBFUSCATE("set_Level"));
@@ -463,9 +623,6 @@ void* hack_thread(void*) {
          reinterpret_cast<void*>(off_cwUpdate),
          reinterpret_cast<void*>(off_saveLocal));
 
-    // ================================================================
-    //  BIND FUNCTION POINTERS
-    // ================================================================
     if (off_setSoftMoney) AddPointer(set_SoftMoney, off_setSoftMoney);
     if (off_setHardMoney) AddPointer(set_HardMoney, off_setHardMoney);
     if (off_setLevel)     AddPointer(set_Level,     off_setLevel);
@@ -477,9 +634,6 @@ void* hack_thread(void*) {
 
     DetachIl2Cpp();
 
-    // ================================================================
-    //  HOOK INSTALL — fence trước để đảm bảo BNM xong hết rồi mới hook
-    // ================================================================
     std::atomic_thread_fence(std::memory_order_seq_cst);
 
     if (off_setSoftMoney) DHK(off_setSoftMoney, capture_set_SoftMoney,  orig_set_SoftMoney);
@@ -489,7 +643,7 @@ void* hack_thread(void*) {
     if (off_saveLocal)    DHK(off_saveLocal,      hook_SaveLocal,         old_SaveLocal);
 
     g_hooksReady.store(true, std::memory_order_release);
-    LOGI(OBFUSCATE("ThrowIO: All hooks live — that's what the hell is going on boss man"));
+    LOGI(OBFUSCATE("ThrowIO: all hooks live — that's what the hell is going on boss man"));
     return nullptr;
 }
 
@@ -511,13 +665,13 @@ void lib_main() {
     }
 
     if (!eglhandle) {
-        LOGE(OBFUSCATE("ThrowIO: FATAL — libEGL.so unavailable after 30 retries"));
+        LOGE(OBFUSCATE("ThrowIO: FATAL — libEGL.so unavailable"));
         return;
     }
 
     void* eglSwapBuffersSym = dlsym(eglhandle, OBFUSCATE("eglSwapBuffers"));
     if (!eglSwapBuffersSym) {
-        LOGE(OBFUSCATE("ThrowIO: FATAL — eglSwapBuffers symbol missing: %s"), dlerror());
+        LOGE(OBFUSCATE("ThrowIO: FATAL — eglSwapBuffers not found: %s"), dlerror());
         return;
     }
 
