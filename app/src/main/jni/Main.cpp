@@ -4,7 +4,6 @@
 // ================================================================
 //  THROWIO MOD - AXIOM DEVELOPMENT
 //  VERSION: FINAL — EGL race fix + BNM fence + ImGui safe init
-//  All fixes merged, production ready
 // ================================================================
 
 // ================================================================
@@ -56,7 +55,7 @@ static EGLContext        g_savedContext = EGL_NO_CONTEXT;
 EGLBoolean (*old_eglSwapBuffers)(EGLDisplay, EGLSurface) = nullptr;
 
 // ================================================================
-//  UTIL: Validate EGL context còn live
+//  UTIL: Validate EGL context
 // ================================================================
 static bool IsEGLContextCurrent() {
     EGLDisplay dpy = eglGetCurrentDisplay();
@@ -71,7 +70,7 @@ static bool IsEGLContextCurrent() {
 }
 
 // ================================================================
-//  UTIL: Validate pointer bộ nhớ trước khi deref
+//  UTIL: Validate pointer bộ nhớ
 // ================================================================
 static bool IsValidPtr(const void* ptr, size_t sz = 1) {
     if (!ptr) return false;
@@ -82,7 +81,7 @@ static bool IsValidPtr(const void* ptr, size_t sz = 1) {
 }
 
 // ================================================================
-//  UTIL: ApplyWatchdog — safe local copy tránh race
+//  UTIL: ApplyWatchdog
 // ================================================================
 static inline void ApplyWatchdog() {
     void* inst = g_BalanceInstance;
@@ -106,7 +105,7 @@ void capture_set_SoftMoney(void* instance, long value) {
 }
 
 // ================================================================
-//  HOOK: ApplyDamage — GodMode block
+//  HOOK: ApplyDamage — GodMode
 // ================================================================
 void hook_ApplyDamage(void* instance, long damage, void* from, bool isCritical, void* extra) {
     if (SWITCH::GodMode && instance) return;
@@ -114,7 +113,7 @@ void hook_ApplyDamage(void* instance, long damage, void* from, bool isCritical, 
 }
 
 // ================================================================
-//  HOOK: SetDeath — GodMode force alive
+//  HOOK: SetDeath — GodMode
 // ================================================================
 void hook_SetDeath(void* instance, bool isDead) {
     if (SWITCH::GodMode && instance) isDead = false;
@@ -139,7 +138,7 @@ void hook_SaveLocal(void* instance) {
 }
 
 // ================================================================
-//  ImGui Style — dark blue theme
+//  ImGui Style
 // ================================================================
 static void ApplyImGuiStyle() {
     ImGuiStyle& st = ImGui::GetStyle();
@@ -165,34 +164,30 @@ static void ApplyImGuiStyle() {
 }
 
 // ================================================================
-//  SafeSetupImGui — validate GL state trước khi init
+//  SafeSetupImGui
 // ================================================================
 static bool SafeSetupImGui(EGLDisplay dpy, EGLSurface surface) {
     if (!IsEGLContextCurrent()) {
         LOGE(OBFUSCATE("ThrowIO: SafeSetupImGui — no valid EGL context, skip"));
         return false;
     }
-
     g_savedDisplay = eglGetCurrentDisplay();
     g_savedContext = eglGetCurrentContext();
-
     while (glGetError() != GL_NO_ERROR) {}
-
     SetupImGui();
-
     GLenum glErr = glGetError();
     if (glErr != GL_NO_ERROR) {
         LOGE(OBFUSCATE("ThrowIO: SetupImGui GL error 0x%x — will retry"), glErr);
         return false;
     }
-
     ApplyImGuiStyle();
-    LOGI(OBFUSCATE("ThrowIO: ImGui setup OK — ctx=%p dpy=%p"), g_savedContext, g_savedDisplay);
+    LOGI(OBFUSCATE("ThrowIO: ImGui setup OK — ctx=%p dpy=%p"),
+         g_savedContext, g_savedDisplay);
     return true;
 }
 
 // ================================================================
-//  HOOK: eglSwapBuffers — main render + ImGui
+//  HOOK: eglSwapBuffers
 // ================================================================
 EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     if (!old_eglSwapBuffers) return EGL_FALSE;
@@ -200,22 +195,20 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     EGLint w = 0, h = 0;
     eglQuerySurface(dpy, surface, EGL_WIDTH,  &w);
     eglQuerySurface(dpy, surface, EGL_HEIGHT, &h);
-
     if (w <= 0 || h <= 0) return old_eglSwapBuffers(dpy, surface);
 
     glWidth  = w;
     glHeight = h;
 
     int frame = g_frameCount.fetch_add(1, std::memory_order_relaxed);
-
     if (frame < 30) return old_eglSwapBuffers(dpy, surface);
 
     if (g_imguiFailed.load(std::memory_order_acquire)) {
         if (frame % 60 != 0) return old_eglSwapBuffers(dpy, surface);
         LOGI(OBFUSCATE("ThrowIO: retrying ImGui setup — frame %d"), frame);
         g_imguiFailed.store(false, std::memory_order_release);
-        g_imguiSetup.store(false, std::memory_order_release);
-        g_eglReady.store(false,   std::memory_order_release);
+        g_imguiSetup.store(false,  std::memory_order_release);
+        g_eglReady.store(false,    std::memory_order_release);
     }
 
     if (!g_imguiSetup.load(std::memory_order_acquire)) {
@@ -233,7 +226,7 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
         return old_eglSwapBuffers(dpy, surface);
 
     if (!IsEGLContextCurrent()) {
-        LOGE(OBFUSCATE("ThrowIO: EGL context lost — frame %d, resetting ImGui"), frame);
+        LOGE(OBFUSCATE("ThrowIO: EGL context lost — frame %d, resetting"), frame);
         g_imguiSetup.store(false, std::memory_order_release);
         g_eglReady.store(false,   std::memory_order_release);
         g_savedContext = EGL_NO_CONTEXT;
@@ -241,9 +234,7 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
         return old_eglSwapBuffers(dpy, surface);
     }
 
-    if (g_hooksReady.load(std::memory_order_acquire)) {
-        ApplyWatchdog();
-    }
+    if (g_hooksReady.load(std::memory_order_acquire)) ApplyWatchdog();
 
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplAndroid_NewFrame();
@@ -254,8 +245,7 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     ImGui::Begin(OBFUSCATE("THROWIO MOD - AXIOM"), nullptr,
                  ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize);
 
-    ImGui::TextColored(ImVec4(0.0f, 0.8f, 1.0f, 1.0f),
-                       OBFUSCATE("  AXIOM DEVELOPMENT"));
+    ImGui::TextColored(ImVec4(0.0f, 0.8f, 1.0f, 1.0f), OBFUSCATE("  AXIOM DEVELOPMENT"));
     ImGui::Separator();
     ImGui::Spacing();
 
@@ -263,21 +253,15 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     bool hooksLive = g_hooksReady.load(std::memory_order_acquire);
 
     ImGui::TextColored(
-        hooksLive ? ImVec4(0.2f, 1.0f, 0.2f,  1.0f)
-                  : ImVec4(1.0f, 0.85f, 0.0f, 1.0f),
-        hooksLive ? OBFUSCATE("  [OK] Hooks Live")
-                  : OBFUSCATE("  [..] Dang Hook — cho chut...")
+        hooksLive ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f) : ImVec4(1.0f, 0.85f, 0.0f, 1.0f),
+        hooksLive ? OBFUSCATE("  [OK] Hooks Live") : OBFUSCATE("  [..] Dang Hook — cho chut...")
     );
     ImGui::TextColored(
-        connected ? ImVec4(0.2f, 1.0f, 0.2f,  1.0f)
-                  : ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
-        connected ? OBFUSCATE("  [OK] Instance Bat Duoc")
-                  : OBFUSCATE("  [..] Chua Co Instance — vao man choi")
+        connected ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f) : ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
+        connected ? OBFUSCATE("  [OK] Instance Bat Duoc") : OBFUSCATE("  [..] Chua Co Instance — vao man choi")
     );
 
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
+    ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
 
     ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.0f, 1.0f), OBFUSCATE(" TIEN TE"));
     ImGui::Spacing();
@@ -293,9 +277,7 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
         }
     }
 
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
+    ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
 
     ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.0f, 1.0f), OBFUSCATE(" TIEN TRINH"));
     ImGui::Spacing();
@@ -309,9 +291,7 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
         }
     }
 
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
+    ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
 
     ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.0f, 1.0f), OBFUSCATE(" CHIEN DAU"));
     ImGui::Spacing();
@@ -322,17 +302,13 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
         ImGui::SliderFloat(OBFUSCATE("Toc Do x"), &speedMultiplier, 1.0f, 5.0f);
     }
 
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
+    ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
 
     ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.0f, 1.0f), OBFUSCATE(" BAO MAT"));
     ImGui::Spacing();
     ImGui::Checkbox(OBFUSCATE("Bypass Anti-Cheat"), &SWITCH::AntiCheat);
 
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
+    ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
 
     ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1.0f),
         OBFUSCATE("frame: %d | ctx: %p | inst: %p"),
@@ -360,8 +336,7 @@ JNI_OnLoad(JavaVM* vm, void* reserved) {
         return JNI_VERSION_1_6;
     }
 
-    UnityPlayer_cls = globalEnv->FindClass(
-        OBFUSCATE("com/unity3d/player/UnityPlayer"));
+    UnityPlayer_cls = globalEnv->FindClass(OBFUSCATE("com/unity3d/player/UnityPlayer"));
     if (!UnityPlayer_cls) {
         LOGE(OBFUSCATE("ThrowIO: UnityPlayer class not found"));
         return JNI_VERSION_1_6;
@@ -400,16 +375,14 @@ void* hack_thread(void*) {
     bool attached = false;
     for (int attempt = 0; attempt < 10 && !attached; attempt++) {
         std::atomic_thread_fence(std::memory_order_seq_cst);
-
         AttachIl2Cpp();
 
-        // getClass() xử lý OBFUSCATE bên trong — KHÔNG đụng vào
         auto probe = getClass(OBFUSCATE("PlayerBalance"), OBFUSCATE("ThrowIO"));
         if (probe) {
             attached = true;
             LOGI(OBFUSCATE("ThrowIO: BNM attached — attempt %d"), attempt);
         } else {
-            LOGE(OBFUSCATE("ThrowIO: attach attempt %d failed, retry in 300ms"), attempt);
+            LOGE(OBFUSCATE("ThrowIO: attach attempt %d failed, retry 300ms"), attempt);
             DetachIl2Cpp();
             usleep(300000);
         }
@@ -427,10 +400,6 @@ void* hack_thread(void*) {
 
     // ================================================================
     //  CLASS LOOKUP
-    //  Explicit type BNM::LoadClass thay vì auto
-    //  getClass() vẫn giữ nguyên — nó handle OBFUSCATE đúng cách
-    //  KHÔNG dùng BNM::LoadClass constructor trực tiếp vì OBFUSCATE
-    //  trả ay::obfuscated_data không convert sang std::string được
     // ================================================================
     BNM::LoadClass balanceClass    = getClass(OBFUSCATE("PlayerBalance"), OBFUSCATE("ThrowIO"));
     BNM::LoadClass charClass       = getClass(OBFUSCATE("Character"),     OBFUSCATE("ThrowIO"));
@@ -438,42 +407,39 @@ void* hack_thread(void*) {
     BNM::LoadClass charWeaponClass = getClass(OBFUSCATE("CharWeapon"),    OBFUSCATE("ThrowIO"));
 
     LOGI(OBFUSCATE("Classes: balance=%d char=%d pdata=%d cweapon=%d"),
-         (bool)balanceClass,
-         (bool)charClass,
-         (bool)playerDataClass,
-         (bool)charWeaponClass);
+         (bool)balanceClass, (bool)charClass,
+         (bool)playerDataClass, (bool)charWeaponClass);
 
     // ================================================================
-    //  THE ACTUAL FIX — boss man đây là cái đang xảy ra:
+    //  THE REAL FIX — boss man đây là cái quan trọng:
     //
-    //  VẤN ĐỀ GỐC:
-    //    Lambda nhận void* cls
-    //    BNM::LoadClass có HAI operator conversion:
-    //      - operator IL2CPP::Il2CppType*()   (line 309)
-    //      - operator MonoType*()              (line 310)
-    //    Cả hai đều convert sang void* được → compiler không biết chọn cái nào
-    //    → error: conversion from 'LoadClass' to 'void *' is ambiguous
+    //  LỖI GỐC:
+    //    Đoạn code cũ cast LoadClass → Il2CppType* → void*
+    //    rồi pass void* vào getOffset() — nhưng getOffset() không
+    //    có overload nào nhận void*, nó chỉ nhận LoadClass trực tiếp.
+    //    Đm, cast vòng vèo như vậy để làm gì.
     //
-    //  FIX:
-    //    1. Lambda nhận BNM::LoadClass thẳng — không cần conversion ở call site
-    //    2. Bên trong lambda, dùng static_cast<IL2CPP::Il2CppType*> tường minh
-    //       → chọn đúng MỘT conversion operator
-    //    3. Sau đó cast sang void* để pass vào getOffset(void*, name)
-    //    → Không còn ambiguity ở BẤT KỲ điểm nào
+    //  FIX ĐÚNG:
+    //    Pass thẳng BNM::LoadClass vào getOffset() — không cast gì cả.
+    //    Loader.h line 31: uintptr_t getOffset(LoadClass clasz, const char* M, int param = 0)
+    //    Đó, nhận LoadClass trực tiếp rồi. Xong.
     // ================================================================
     auto safe_offset = [](BNM::LoadClass cls, const char* name) -> uintptr_t {
         if (!cls) {
-            LOGE(OBFUSCATE("ThrowIO: null class cho [%s]"), name);
+            LOGE(OBFUSCATE("ThrowIO: null class cho [%s] — skip"), name);
             return 0;
         }
-        // Tường minh chọn IL2CPP::Il2CppType* — giết ambiguity
-        IL2CPP::Il2CppType* typePtr = static_cast<IL2CPP::Il2CppType*>(cls);
-        void* clsVoid               = static_cast<void*>(typePtr);
-        auto  off                   = getOffset(clsVoid, name);
-        if (!off) LOGE(OBFUSCATE("ThrowIO: offset 0 cho [%s], đm"), name);
+        // ✅ ĐÚNG: pass LoadClass thẳng, default param = 0
+        uintptr_t off = getOffset(cls, name, 0);
+        if (!off) {
+            LOGE(OBFUSCATE("ThrowIO: offset = 0 cho [%s] — method không tìm thấy, đm"), name);
+        }
         return off;
     };
 
+    // ================================================================
+    //  OFFSET LOOKUP
+    // ================================================================
     auto off_setSoftMoney = safe_offset(balanceClass,    OBFUSCATE("set_SoftMoney"));
     auto off_setHardMoney = safe_offset(balanceClass,    OBFUSCATE("set_HardMoney"));
     auto off_setLevel     = safe_offset(balanceClass,    OBFUSCATE("set_Level"));
@@ -497,6 +463,9 @@ void* hack_thread(void*) {
          reinterpret_cast<void*>(off_cwUpdate),
          reinterpret_cast<void*>(off_saveLocal));
 
+    // ================================================================
+    //  BIND FUNCTION POINTERS
+    // ================================================================
     if (off_setSoftMoney) AddPointer(set_SoftMoney, off_setSoftMoney);
     if (off_setHardMoney) AddPointer(set_HardMoney, off_setHardMoney);
     if (off_setLevel)     AddPointer(set_Level,     off_setLevel);
@@ -508,6 +477,9 @@ void* hack_thread(void*) {
 
     DetachIl2Cpp();
 
+    // ================================================================
+    //  HOOK INSTALL — fence trước để đảm bảo BNM xong hết rồi mới hook
+    // ================================================================
     std::atomic_thread_fence(std::memory_order_seq_cst);
 
     if (off_setSoftMoney) DHK(off_setSoftMoney, capture_set_SoftMoney,  orig_set_SoftMoney);
@@ -517,7 +489,7 @@ void* hack_thread(void*) {
     if (off_saveLocal)    DHK(off_saveLocal,      hook_SaveLocal,         old_SaveLocal);
 
     g_hooksReady.store(true, std::memory_order_release);
-    LOGI(OBFUSCATE("ThrowIO: All hooks installed — that's what the hell is going on"));
+    LOGI(OBFUSCATE("ThrowIO: All hooks live — that's what the hell is going on boss man"));
     return nullptr;
 }
 
