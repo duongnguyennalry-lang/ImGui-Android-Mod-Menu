@@ -45,6 +45,18 @@ void SetupImGui() {
 namespace Menu {
 
     // ================================================================
+    //  KHAI BÁO CÁC HÀM VÀ BIẾN ĐỂ FIX LỖI BUILD
+    // ================================================================
+    // Lưu trữ địa chỉ của object (instance) chứa thông tin tiền tệ/level
+    void* g_BalanceInstance = nullptr; 
+
+    // Khai báo cấu trúc của các hàm set trong game (thường trả về void và nhận instance + value)
+    void (*set_SoftMoney)(void* instance, int value) = nullptr;
+    void (*set_HardMoney)(void* instance, int value) = nullptr;
+    void (*set_Level)(void* instance, int value) = nullptr;
+    void (*set_Exp)(void* instance, int value) = nullptr;
+
+    // ================================================================
     //  SWITCH - TRẠNG THÁI CÁC CHỨC NĂNG
     // ================================================================
     struct {
