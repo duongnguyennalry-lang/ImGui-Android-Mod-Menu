@@ -308,6 +308,13 @@ namespace UNITY_STRUCTS {
         [[maybe_unused]] MonoType *GetMonoType() const;
         operator IL2CPP::Il2CppType *() const { return GetIl2CppType(); };
         operator MonoType *() const { return GetMonoType(); };
+        // ─────────────────────────────────────────────────────────
+        // FIX: explicit bool conversion so ternary/if checks like
+        // `balanceClass ? ... : 0` don't have to guess between the
+        // Il2CppType* and MonoType* implicit operators above.
+        // Without this, that guess is ambiguous and the build fails.
+        // ─────────────────────────────────────────────────────────
+        explicit operator bool() const noexcept { return klass != nullptr; }
         void *CreateNewInstance() const;
         IL2CPP::Il2CppClass *GetIl2CppClass() const;
         [[maybe_unused]] std::string GetClassName() const;
