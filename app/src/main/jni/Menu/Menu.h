@@ -8,6 +8,16 @@ using namespace ImGui;
 static bool init;
 int glWidth, glHeight;
 
+// ================================================================
+//  EXTERN — Trỏ về biến/hàm đã khai báo trong Main.cpp
+//  KHÔNG khai báo lại ở đây, chỉ báo compiler "nó tồn tại ở chỗ khác"
+// ================================================================
+extern void*  g_BalanceInstance;
+extern void (*set_SoftMoney)(void* instance, long value);
+extern void (*set_HardMoney)(void* instance, long value);
+extern void (*set_Level)    (void* instance, int  value);
+extern void (*set_Exp)      (void* instance, int  value);
+
 void SetupImGui() {
     if (!init) {
         auto context = ImGui::CreateContext();
@@ -45,36 +55,16 @@ void SetupImGui() {
 namespace Menu {
 
     // ================================================================
-    //  KHAI BÁO CÁC HÀM VÀ BIẾN ĐỂ FIX LỖI BUILD
-    // ================================================================
-    // Lưu trữ địa chỉ của object (instance) chứa thông tin tiền tệ/level
-    void* g_BalanceInstance = nullptr; 
-
-    // Khai báo cấu trúc của các hàm set trong game (thường trả về void và nhận instance + value)
-    void (*set_SoftMoney)(void* instance, int value) = nullptr;
-    void (*set_HardMoney)(void* instance, int value) = nullptr;
-    void (*set_Level)(void* instance, int value) = nullptr;
-    void (*set_Exp)(void* instance, int value) = nullptr;
-
-    // ================================================================
     //  SWITCH - TRẠNG THÁI CÁC CHỨC NĂNG
     // ================================================================
     struct {
-        // TIỀN TỆ
         bool TienMemVoHan    = false;
         bool KimCuongVoHan   = false;
         bool BoQuangCao      = false;
-
-        // TIẾN TRÌNH
         bool MaxLevel        = false;
-
-        // CHIẾN ĐẤU
-        bool BatTu           = false;  // God Mode
-        bool TangTocDo       = false;  // Speed Hack
-
-        // BẢO MẬT
-        bool BypassAC        = true;   // Anti-Cheat bypass
-
+        bool BatTu           = false;
+        bool TangTocDo       = false;
+        bool BypassAC        = true;
     } SWITCH;
 
     struct {
@@ -87,7 +77,7 @@ namespace Menu {
     float tocDoNhan = 2.0f;
 
     // ================================================================
-    //  DRAW MENU - GIAO DIỆN CHÍNH
+    //  DRAW MENU
     // ================================================================
     void DrawMenu() {
         ImGuiIO &io = ImGui::GetIO();
@@ -98,7 +88,6 @@ namespace Menu {
         ImGui::SetNextWindowSize(ImVec2(400, 480), ImGuiCond_FirstUseEver);
         ImGui::Begin("  THROW.IO MOD  |  AXIOM  ", p_open, ImGuiWindowFlags_MenuBar);
 
-        // ============ MENU BAR ============
         if (ImGui::BeginMenuBar()) {
             if (ImGui::BeginMenu("Cong Cu")) {
                 ImGui::MenuItem("Style Editor", NULL, &showStyleEditor);
@@ -108,18 +97,14 @@ namespace Menu {
             ImGui::EndMenuBar();
         }
 
-        // ============ HEADER ============
         ImGui::TextColored(ImVec4(0.0f, 0.8f, 1.0f, 1.0f), "  AXIOM DEVELOPMENT");
         ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1.0f), "  ThrowIO IL2CPP | BNM Auto-Offset");
         ImGui::Separator();
         ImGui::Spacing();
 
-        // ============ TABS ============
-        if (ImGui::BeginTabBar("##Tabs", ImGuiTabBarFlags_None)) {
+        if (ImGui::BeginTabBar("##Tabs")) {
 
-            // ================================================
-            //  TAB 1: TIỀN TỆ
-            // ================================================
+            // ── TAB: TIỀN TỆ ──────────────────────────────────────────
             if (ImGui::BeginTabItem("Tien Te")) {
                 ImGui::Spacing();
                 ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f), "[ Quan Ly Tien ]");
@@ -135,22 +120,20 @@ namespace Menu {
                     ImGui::TextColored(ImVec4(0,1,0,1), "  >> DANG HOAT DONG");
 
                 ImGui::Spacing();
-                ImGui::Checkbox("Bo Quang Cao",     &SWITCH.BoQuangCao);
+                ImGui::Checkbox("Bo Quang Cao", &SWITCH.BoQuangCao);
 
                 ImGui::Spacing();
+                // Dùng thẳng biến global (extern ở trên) — không cần prefix gì
                 if (ImGui::Button("Cap Nhat Tien Ngay!", ImVec2(-1, 40))) {
                     if (set_SoftMoney && g_BalanceInstance)
                         set_SoftMoney(g_BalanceInstance, 0x7FFFFFFF);
                     if (set_HardMoney && g_BalanceInstance)
                         set_HardMoney(g_BalanceInstance, 0x7FFFFFFF);
                 }
-
                 ImGui::EndTabItem();
             }
 
-            // ================================================
-            //  TAB 2: TIẾN TRÌNH
-            // ================================================
+            // ── TAB: TIẾN TRÌNH ───────────────────────────────────────
             if (ImGui::BeginTabItem("Tien Trinh")) {
                 ImGui::Spacing();
                 ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f), "[ Cap Do & Kinh Nghiem ]");
@@ -167,13 +150,10 @@ namespace Menu {
                     if (set_Exp && g_BalanceInstance)
                         set_Exp(g_BalanceInstance, 0x7FFFFFFF);
                 }
-
                 ImGui::EndTabItem();
             }
 
-            // ================================================
-            //  TAB 3: CHIẾN ĐẤU
-            // ================================================
+            // ── TAB: CHIẾN ĐẤU ───────────────────────────────────────
             if (ImGui::BeginTabItem("Chien Dau")) {
                 ImGui::Spacing();
                 ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f), "[ Chien Dau ]");
@@ -189,13 +169,10 @@ namespace Menu {
                     ImGui::TextColored(ImVec4(0,1,0,1), "  >> DANG HOAT DONG");
                     ImGui::SliderFloat("He So Toc Do", &tocDoNhan, 1.0f, 5.0f);
                 }
-
                 ImGui::EndTabItem();
             }
 
-            // ================================================
-            //  TAB 4: BẢO MẬT
-            // ================================================
+            // ── TAB: BẢO MẬT ─────────────────────────────────────────
             if (ImGui::BeginTabItem("Bao Mat")) {
                 ImGui::Spacing();
                 ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "[ Chong Phat Hien ]");
@@ -206,24 +183,19 @@ namespace Menu {
                     ImGui::TextColored(ImVec4(0,1,0,1), "  >> DANG HOAT DONG");
 
                 ImGui::Spacing();
-                ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.2f, 1.0f),
-                    "[!] Hook vao SaveLocal");
-                ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.2f, 1.0f),
-                    "[!] Khong tang qua nhieu 1 luc");
-
+                ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.2f, 1.0f), "[!] Hook vao SaveLocal");
+                ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.2f, 1.0f), "[!] Khong tang qua nhieu 1 luc");
                 ImGui::EndTabItem();
             }
 
             ImGui::EndTabBar();
         }
 
-        // FPS + Style editor
         if (showStyleEditor) {
             ImGui::Begin("Style Editor", &showStyleEditor);
             ImGui::ShowStyleEditor();
             ImGui::End();
         }
-
         if (showFPS) {
             ImGui::SetNextWindowBgAlpha(0.4f);
             ImGui::Begin("FPS", &showFPS,
@@ -234,8 +206,7 @@ namespace Menu {
             ImGui::End();
         }
 
-        ImGui::TextColored(ImVec4(0.3f, 0.3f, 0.3f, 1.0f),
-            "%.1f FPS", ImGui::GetIO().Framerate);
+        ImGui::TextColored(ImVec4(0.3f, 0.3f, 0.3f, 1.0f), "%.1f FPS", ImGui::GetIO().Framerate);
         ImGui::End();
     }
 
