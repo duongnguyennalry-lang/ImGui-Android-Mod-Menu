@@ -2,11 +2,9 @@
 
 // ================================================================
 //  THROWIO MOD - AXIOM DEVELOPMENT
+//  FIX: EGL race condition, null-safe hooks, deferred ImGui init
 // ================================================================
 
-// ================================================================
-//  FUNCTION POINTERS
-// ================================================================
 void (*set_SoftMoney)(void* instance, long value);
 void (*set_HardMoney)(void* instance, long value);
 void (*set_Level)    (void* instance, int  value);
@@ -20,9 +18,7 @@ void (*old_ApplyDamage)      (void* instance, long damage, void* from, bool isCr
 void (*old_SetDeath)         (void* instance, bool isDead);
 void (*old_CharWeapon_update)(void* instance, float deltaTime);
 void (*old_SaveLocal)        (void* instance);
-
-// Capture instance
-void (*orig_set_SoftMoney)(void* instance, long value);
+void (*orig_set_SoftMoney)   (void* instance, long value);
 
 // ================================================================
 //  TOGGLES
@@ -43,124 +39,166 @@ namespace SWITCH {
 void*  g_BalanceInstance = nullptr;
 float  speedMultiplier   = 2.0f;
 
-// eglSwapBuffers — đúng signature, KHÔNG variadic
-EGLBoolean (*old_eglSwapBuffers)(EGLDisplay, EGLSurface);
+// FIX: frame counter — defer ImGui init until surface is stable
+static std::atomic<int>  g_frameCount{0};
+static std::atomic<bool> g_eglReady{false};
+static std::atomic<bool> g_imguiSetup{false};
+
+// FIX: EGL hook pointer declared properly
+EGLBoolean (*old_eglSwapBuffers)(EGLDisplay, EGLSurface) = nullptr;
 
 // ================================================================
-//  HOOK: Capture g_BalanceInstance từ set_SoftMoney
+//  INLINE HELPERS
+// ================================================================
+static inline void ApplyWatchdog() {
+    if (!g_BalanceInstance) return;
+    if (SWITCH::InfiniteMoney   && set_SoftMoney) set_SoftMoney(g_BalanceInstance, 0x7FFFFFFF);
+    if (SWITCH::InfinitePremium && set_HardMoney) set_HardMoney(g_BalanceInstance, 0x7FFFFFFF);
+    if (SWITCH::MaxLevel        && set_Level)     set_Level    (g_BalanceInstance, 99);
+    if (SWITCH::MaxLevel        && set_Exp)       set_Exp      (g_BalanceInstance, 0x7FFFFFFF);
+    if (SWITCH::NoAds           && set_NoAds)     set_NoAds    (g_BalanceInstance, true);
+}
+
+// ================================================================
+//  HOOK: Capture g_BalanceInstance
 // ================================================================
 void capture_set_SoftMoney(void* instance, long value) {
     if (instance && !g_BalanceInstance) {
         g_BalanceInstance = instance;
-        LOGI(OBFUSCATE("ThrowIO: g_BalanceInstance captured -> %p"), instance);
+        LOGI(OBFUSCATE("ThrowIO: instance captured -> %p"), instance);
     }
     if (orig_set_SoftMoney) orig_set_SoftMoney(instance, value);
 }
 
 // ================================================================
-//  HOOK: ApplyDamage — God Mode
+//  HOOK: ApplyDamage
 // ================================================================
 void hook_ApplyDamage(void* instance, long damage, void* from, bool isCritical, void* extra) {
-    if (SWITCH::GodMode && instance != nullptr) {
-        return; // Hủy damage hoàn toàn
-    }
+    if (SWITCH::GodMode && instance) return;
     if (old_ApplyDamage) old_ApplyDamage(instance, damage, from, isCritical, extra);
 }
 
 // ================================================================
-//  HOOK: SetDeath — Không cho chết
+//  HOOK: SetDeath
 // ================================================================
 void hook_SetDeath(void* instance, bool isDead) {
-    if (SWITCH::GodMode && instance != nullptr) {
-        isDead = false;
-    }
+    if (SWITCH::GodMode && instance) isDead = false;
     if (old_SetDeath) old_SetDeath(instance, isDead);
 }
 
 // ================================================================
-//  HOOK: CharWeapon::update — Speed Hack
+//  HOOK: CharWeapon::update
 // ================================================================
 void hook_CharWeapon_update(void* instance, float deltaTime) {
-    if (SWITCH::SpeedHack && instance != nullptr) {
-        deltaTime *= speedMultiplier;
-    }
+    if (SWITCH::SpeedHack && instance) deltaTime *= speedMultiplier;
     if (old_CharWeapon_update) old_CharWeapon_update(instance, deltaTime);
 }
 
 // ================================================================
-//  HOOK: PlayerData::SaveLocal — Anti-Cheat Bypass
+//  HOOK: SaveLocal — Anti-Cheat sandwich
 // ================================================================
 void hook_SaveLocal(void* instance) {
-    if (SWITCH::AntiCheat && g_BalanceInstance != nullptr) {
-        if (SWITCH::InfiniteMoney   && set_SoftMoney) set_SoftMoney(g_BalanceInstance, 0x7FFFFFFF);
-        if (SWITCH::InfinitePremium && set_HardMoney) set_HardMoney(g_BalanceInstance, 0x7FFFFFFF);
-        if (SWITCH::MaxLevel        && set_Level)     set_Level    (g_BalanceInstance, 99);
-        if (SWITCH::MaxLevel        && set_Exp)       set_Exp      (g_BalanceInstance, 0x7FFFFFFF);
-        if (SWITCH::NoAds           && set_NoAds)     set_NoAds    (g_BalanceInstance, true);
-    }
-
+    if (SWITCH::AntiCheat) ApplyWatchdog();
     if (old_SaveLocal) old_SaveLocal(instance);
-
-    if (SWITCH::AntiCheat && g_BalanceInstance != nullptr) {
-        if (SWITCH::InfiniteMoney   && set_SoftMoney) set_SoftMoney(g_BalanceInstance, 0x7FFFFFFF);
-        if (SWITCH::InfinitePremium && set_HardMoney) set_HardMoney(g_BalanceInstance, 0x7FFFFFFF);
-        if (SWITCH::MaxLevel        && set_Level)     set_Level    (g_BalanceInstance, 99);
-    }
+    if (SWITCH::AntiCheat) ApplyWatchdog();
 }
 
 // ================================================================
-//  HOOK: eglSwapBuffers — Vẽ ImGui Menu
+//  FIX: Safe ImGui style setup — call once per context
+// ================================================================
+static void ApplyImGuiStyle() {
+    ImGuiStyle& st = ImGui::GetStyle();
+    st.WindowRounding    = 10.0f;
+    st.FrameRounding     = 5.0f;
+    st.ScrollbarRounding = 5.0f;
+    st.GrabRounding      = 4.0f;
+    st.WindowPadding     = ImVec2(12, 12);
+    st.ItemSpacing       = ImVec2(8, 6);
+
+    st.Colors[ImGuiCol_WindowBg]       = ImVec4(0.04f, 0.04f, 0.07f, 0.97f);
+    st.Colors[ImGuiCol_TitleBg]        = ImVec4(0.0f,  0.12f, 0.3f,  1.0f);
+    st.Colors[ImGuiCol_TitleBgActive]  = ImVec4(0.0f,  0.2f,  0.5f,  1.0f);
+    st.Colors[ImGuiCol_FrameBg]        = ImVec4(0.1f,  0.1f,  0.16f, 1.0f);
+    st.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.15f, 0.15f, 0.25f, 1.0f);
+    st.Colors[ImGuiCol_CheckMark]      = ImVec4(0.0f,  0.9f,  1.0f,  1.0f);
+    st.Colors[ImGuiCol_SliderGrab]     = ImVec4(0.0f,  0.7f,  1.0f,  1.0f);
+    st.Colors[ImGuiCol_Button]         = ImVec4(0.0f,  0.25f, 0.55f, 1.0f);
+    st.Colors[ImGuiCol_ButtonHovered]  = ImVec4(0.0f,  0.4f,  0.8f,  1.0f);
+    st.Colors[ImGuiCol_ButtonActive]   = ImVec4(0.0f,  0.6f,  1.0f,  1.0f);
+    st.Colors[ImGuiCol_Header]         = ImVec4(0.0f,  0.3f,  0.6f,  0.8f);
+    st.Colors[ImGuiCol_Separator]      = ImVec4(0.2f,  0.2f,  0.3f,  1.0f);
+}
+
+// ================================================================
+//  HOOK: eglSwapBuffers — main render loop
+//  FIX: deferred init, frame-gated setup, null-safe teardown
 // ================================================================
 EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
-    eglQuerySurface(dpy, surface, EGL_WIDTH,  &glWidth);
-    eglQuerySurface(dpy, surface, EGL_HEIGHT, &glHeight);
+    // FIX: bail early if trampoline not ready
+    if (!old_eglSwapBuffers) return EGL_FALSE;
 
-    if (!setup) {
+    // FIX: query dimensions every frame (handles rotation/resize)
+    EGLint w = 0, h = 0;
+    eglQuerySurface(dpy, surface, EGL_WIDTH,  &w);
+    eglQuerySurface(dpy, surface, EGL_HEIGHT, &h);
+
+    // FIX: don't try to render on a zero-size surface
+    if (w <= 0 || h <= 0) return old_eglSwapBuffers(dpy, surface);
+
+    glWidth  = w;
+    glHeight = h;
+
+    int frame = g_frameCount.fetch_add(1);
+
+    // FIX: wait 8 frames before touching ImGui — surface must be stable
+    if (frame < 8) return old_eglSwapBuffers(dpy, surface);
+
+    if (!g_imguiSetup.load()) {
         SetupImGui();
-        setup = true;
+        ApplyImGuiStyle();
+        g_imguiSetup.store(true);
+        g_eglReady.store(true);
     }
 
-    // Watchdog — apply mỗi frame
-    if (g_BalanceInstance != nullptr) {
-        if (SWITCH::InfiniteMoney   && set_SoftMoney) set_SoftMoney(g_BalanceInstance, 0x7FFFFFFF);
-        if (SWITCH::InfinitePremium && set_HardMoney) set_HardMoney(g_BalanceInstance, 0x7FFFFFFF);
-        if (SWITCH::MaxLevel        && set_Level)     set_Level    (g_BalanceInstance, 99);
-        if (SWITCH::MaxLevel        && set_Exp)       set_Exp      (g_BalanceInstance, 0x7FFFFFFF);
-        if (SWITCH::NoAds           && set_NoAds)     set_NoAds    (g_BalanceInstance, true);
-    }
+    if (!g_eglReady.load()) return old_eglSwapBuffers(dpy, surface);
 
-    // ── ImGui Frame ───────────────────────────────────────────────
+    // Watchdog every frame
+    ApplyWatchdog();
+
+    // ── ImGui Frame ────────────────────────────────────────────
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplAndroid_NewFrame();
     ImGui::NewFrame();
 
-    ImGuiStyle& st = ImGui::GetStyle();
-    st.WindowRounding = 8.0f;
-    st.FrameRounding  = 4.0f;
-    st.Colors[ImGuiCol_WindowBg]      = ImVec4(0.05f, 0.05f, 0.08f, 0.97f);
-    st.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.0f,  0.2f,  0.5f,  1.0f);
-    st.Colors[ImGuiCol_CheckMark]     = ImVec4(0.0f,  0.9f,  1.0f,  1.0f);
+    ImGui::SetNextWindowSize(ImVec2(370, 460), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(10, 10),    ImGuiCond_FirstUseEver);
+    ImGui::Begin(OBFUSCATE("THROWIO MOD - AXIOM"), nullptr,
+                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize);
 
-    ImGui::SetNextWindowSize(ImVec2(360, 420), ImGuiCond_FirstUseEver);
-    ImGui::Begin(OBFUSCATE("THROWIO MOD - AXIOM"));
-
-    ImGui::TextColored(ImVec4(0.0f, 0.8f, 1.0f, 1.0f), OBFUSCATE("AXIOM DEVELOPMENT"));
+    // Header
+    ImGui::TextColored(ImVec4(0.0f, 0.8f, 1.0f, 1.0f), OBFUSCATE("  AXIOM DEVELOPMENT"));
     ImGui::Separator();
-
-    // Status
-    ImGui::TextColored(
-        g_BalanceInstance ? ImVec4(0,1,0,1) : ImVec4(1,0.3f,0.3f,1),
-        g_BalanceInstance ? OBFUSCATE("Ket noi: OK") : OBFUSCATE("Dang doi... (vao man choi)")
-    );
-
     ImGui::Spacing();
 
-    // ── TIỀN TỆ ──────────────────────────────────────────────────
-    ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.0f, 1.0f), OBFUSCATE("[ TIEN TE ]"));
+    // Status badge
+    bool connected = (g_BalanceInstance != nullptr);
+    ImGui::TextColored(
+        connected ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f) : ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
+        connected ? OBFUSCATE("  [OK] Connected")
+                  : OBFUSCATE("  [..] Waiting — enter gameplay")
+    );
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // ── CURRENCY ───────────────────────────────────────────────
+    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.0f, 1.0f), OBFUSCATE(" TIEN TE"));
+    ImGui::Spacing();
     ImGui::Checkbox(OBFUSCATE("Tien Mem Vo Han"),       &SWITCH::InfiniteMoney);
     ImGui::Checkbox(OBFUSCATE("Tien Premium Vo Han"),   &SWITCH::InfinitePremium);
     ImGui::Checkbox(OBFUSCATE("Bo Quang Cao (No Ads)"), &SWITCH::NoAds);
-    if (ImGui::Button(OBFUSCATE("Cap Nhat Tien Ngay"), ImVec2(-1, 35))) {
+    ImGui::Spacing();
+    if (ImGui::Button(OBFUSCATE("Cap Nhat Tien Ngay"), ImVec2(-1.0f, 36.0f))) {
         if (g_BalanceInstance) {
             if (set_SoftMoney) set_SoftMoney(g_BalanceInstance, 0x7FFFFFFF);
             if (set_HardMoney) set_HardMoney(g_BalanceInstance, 0x7FFFFFFF);
@@ -168,11 +206,15 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     }
 
     ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
 
-    // ── TIẾN TRÌNH ────────────────────────────────────────────────
-    ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.0f, 1.0f), OBFUSCATE("[ TIEN TRINH ]"));
+    // ── PROGRESSION ────────────────────────────────────────────
+    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.0f, 1.0f), OBFUSCATE(" TIEN TRINH"));
+    ImGui::Spacing();
     ImGui::Checkbox(OBFUSCATE("Max Level 99"), &SWITCH::MaxLevel);
-    if (ImGui::Button(OBFUSCATE("Len Cap Ngay"), ImVec2(-1, 35))) {
+    ImGui::Spacing();
+    if (ImGui::Button(OBFUSCATE("Len Cap Ngay"), ImVec2(-1.0f, 36.0f))) {
         if (g_BalanceInstance) {
             if (set_Level) set_Level(g_BalanceInstance, 99);
             if (set_Exp)   set_Exp  (g_BalanceInstance, 0x7FFFFFFF);
@@ -180,19 +222,34 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     }
 
     ImGui::Spacing();
-
-    // ── CHIẾN ĐẤU ────────────────────────────────────────────────
-    ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.0f, 1.0f), OBFUSCATE("[ CHIEN DAU ]"));
-    ImGui::Checkbox(OBFUSCATE("God Mode (Bat Tu)"), &SWITCH::GodMode);
-    ImGui::Checkbox(OBFUSCATE("Speed Hack"),        &SWITCH::SpeedHack);
-    if (SWITCH::SpeedHack)
-        ImGui::SliderFloat(OBFUSCATE("Toc Do"), &speedMultiplier, 1.0f, 5.0f);
-
+    ImGui::Separator();
     ImGui::Spacing();
 
-    // ── BẢO MẬT ──────────────────────────────────────────────────
-    ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.0f, 1.0f), OBFUSCATE("[ BAO MAT ]"));
+    // ── COMBAT ─────────────────────────────────────────────────
+    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.0f, 1.0f), OBFUSCATE(" CHIEN DAU"));
+    ImGui::Spacing();
+    ImGui::Checkbox(OBFUSCATE("God Mode (Bat Tu)"), &SWITCH::GodMode);
+    ImGui::Checkbox(OBFUSCATE("Speed Hack"),        &SWITCH::SpeedHack);
+    if (SWITCH::SpeedHack) {
+        ImGui::Spacing();
+        ImGui::SliderFloat(OBFUSCATE("Toc Do x"), &speedMultiplier, 1.0f, 5.0f);
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // ── SECURITY ───────────────────────────────────────────────
+    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.0f, 1.0f), OBFUSCATE(" BAO MAT"));
+    ImGui::Spacing();
     ImGui::Checkbox(OBFUSCATE("Bypass Anti-Cheat"), &SWITCH::AntiCheat);
+
+    ImGui::Spacing();
+    ImGui::Separator();
+
+    // FIX: show frame count for debug visibility
+    ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1.0f),
+                       OBFUSCATE("frame: %d"), frame);
 
     ImGui::End();
     ImGui::Render();
@@ -210,7 +267,8 @@ JNI_OnLoad(JavaVM *vm, void *reserved) {
     JNIEnv *globalEnv;
     vm->GetEnv((void **) &globalEnv, JNI_VERSION_1_6);
 
-    UnityPlayer_cls = globalEnv->FindClass(OBFUSCATE("com/unity3d/player/UnityPlayer"));
+    UnityPlayer_cls = globalEnv->FindClass(
+        OBFUSCATE("com/unity3d/player/UnityPlayer"));
     UnityPlayer_CurrentActivity_fid = globalEnv->GetStaticFieldID(
         UnityPlayer_cls,
         OBFUSCATE("currentActivity"),
@@ -228,7 +286,6 @@ JNI_OnLoad(JavaVM *vm, void *reserved) {
 //  HACK THREAD
 // ================================================================
 void *hack_thread(void *) {
-    // Đợi libil2cpp load xong
     do { sleep(1); } while (!isLibraryLoaded(targetLibName));
     address = findLibrary(targetLibName);
 
@@ -238,7 +295,6 @@ void *hack_thread(void *) {
     Menu::Screen_get_height = (int(*)()) OBFBNM("UnityEngine", "Screen", "get_height", 0);
     Menu::Screen_get_width  = (int(*)()) OBFBNM("UnityEngine", "Screen", "get_width",  0);
 
-    // ── Tìm class ──────────────────────────────────────────────
     auto balanceClass    = getClass(OBFUSCATE("PlayerBalance"), OBFUSCATE("ThrowIO"));
     auto charClass       = getClass(OBFUSCATE("Character"),     OBFUSCATE("ThrowIO"));
     auto playerDataClass = getClass(OBFUSCATE("PlayerData"),    OBFUSCATE("ThrowIO"));
@@ -247,7 +303,6 @@ void *hack_thread(void *) {
     LOGI(OBFUSCATE("Classes: balance=%p char=%p pdata=%p cweapon=%p"),
          balanceClass, charClass, playerDataClass, charWeaponClass);
 
-    // ── Lấy offset — null check trước ──────────────────────────
     auto off_setSoftMoney = balanceClass    ? getOffset(balanceClass,    OBFUSCATE("set_SoftMoney")) : 0;
     auto off_setHardMoney = balanceClass    ? getOffset(balanceClass,    OBFUSCATE("set_HardMoney")) : 0;
     auto off_setLevel     = balanceClass    ? getOffset(balanceClass,    OBFUSCATE("set_Level"))     : 0;
@@ -267,7 +322,6 @@ void *hack_thread(void *) {
          (void*)off_applyDamage,  (void*)off_setDeath,
          (void*)off_cwUpdate,     (void*)off_saveLocal);
 
-    // ── Gán function pointer ────────────────────────────────────
     if (off_setSoftMoney) AddPointer(set_SoftMoney, off_setSoftMoney);
     if (off_setHardMoney) AddPointer(set_HardMoney, off_setHardMoney);
     if (off_setLevel)     AddPointer(set_Level,     off_setLevel);
@@ -279,22 +333,11 @@ void *hack_thread(void *) {
 
     DetachIl2Cpp();
 
-    // ── DHK — null check hết, KHÔNG DHK(0) ─────────────────────
-    // Hook set_SoftMoney để bắt instance
-    if (off_setSoftMoney)
-        DHK(off_setSoftMoney, capture_set_SoftMoney, orig_set_SoftMoney);
-
-    if (off_applyDamage)
-        DHK(off_applyDamage, hook_ApplyDamage, old_ApplyDamage);
-
-    if (off_setDeath)
-        DHK(off_setDeath, hook_SetDeath, old_SetDeath);
-
-    if (off_cwUpdate)
-        DHK(off_cwUpdate, hook_CharWeapon_update, old_CharWeapon_update);
-
-    if (off_saveLocal)
-        DHK(off_saveLocal, hook_SaveLocal, old_SaveLocal);
+    if (off_setSoftMoney) DHK(off_setSoftMoney, capture_set_SoftMoney, orig_set_SoftMoney);
+    if (off_applyDamage)  DHK(off_applyDamage,  hook_ApplyDamage,      old_ApplyDamage);
+    if (off_setDeath)     DHK(off_setDeath,      hook_SetDeath,         old_SetDeath);
+    if (off_cwUpdate)     DHK(off_cwUpdate,      hook_CharWeapon_update,old_CharWeapon_update);
+    if (off_saveLocal)    DHK(off_saveLocal,      hook_SaveLocal,        old_SaveLocal);
 
     LOGI(OBFUSCATE("ThrowIO: All hooks installed!"));
     return nullptr;
@@ -302,13 +345,32 @@ void *hack_thread(void *) {
 
 // ================================================================
 //  ENTRY POINT
+//  FIX: null-check eglhandle + eglSwapBuffers before DHK
+//       retry loop if EGL not yet loaded at constructor time
 // ================================================================
 __attribute__((constructor))
 void lib_main() {
-    auto eglhandle      = dlopen(OBFUSCATE("libEGL.so"), RTLD_LAZY);
-    auto eglSwapBuffers = dlsym(eglhandle, OBFUSCATE("eglSwapBuffers"));
-    DHK(eglSwapBuffers, hook_eglSwapBuffers, old_eglSwapBuffers);
+    // FIX: retry dlopen — EGL may not be mapped yet at constructor time
+    void* eglhandle = nullptr;
+    for (int retry = 0; retry < 20 && !eglhandle; retry++) {
+        eglhandle = dlopen(OBFUSCATE("libEGL.so"), RTLD_NOW | RTLD_GLOBAL);
+        if (!eglhandle) usleep(50000); // 50ms between retries
+    }
+
+    if (!eglhandle) {
+        LOGE(OBFUSCATE("ThrowIO: FATAL — libEGL.so not found after retries"));
+        return;
+    }
+
+    auto eglSwapBuffersSym = dlsym(eglhandle, OBFUSCATE("eglSwapBuffers"));
+    if (!eglSwapBuffersSym) {
+        LOGE(OBFUSCATE("ThrowIO: FATAL — eglSwapBuffers symbol not resolved"));
+        return;
+    }
+
+    DHK(eglSwapBuffersSym, hook_eglSwapBuffers, old_eglSwapBuffers);
+    LOGI(OBFUSCATE("ThrowIO: eglSwapBuffers hooked -> %p"), eglSwapBuffersSym);
 
     pthread_t ptid;
-    pthread_create(&ptid, NULL, hack_thread, NULL);
+    pthread_create(&ptid, nullptr, hack_thread, nullptr);
 }
