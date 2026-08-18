@@ -1,5 +1,13 @@
+// ← THÊM 2 DÒNG NÀY — phải đứng TRƯỚC #include "MainHeader.h"
+#include <GLES3/gl3.h>
+#include <GLES3/gl3ext.h>
+
 #include "MainHeader.h"
 #include "CrashLogger.h"
+
+// ================================================================
+//  THROWIO MOD - AXIOM DEVELOPMENT
+// ... phần còn lại giữ nguyên y chang
 
 // ================================================================
 //  THROWIO MOD - AXIOM DEVELOPMENT
